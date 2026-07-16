@@ -1,0 +1,73 @@
+# TASK-7.1 — Rep phase config for the Rep Counter state machine.
+# Design ref: §2.4. REQs: REQ-4.1, REQ-4.2
+#
+# Phase state machine (design.md §2.4):
+#   NEUTRAL
+#     → ECCENTRIC  when primary angle crosses eccentric_threshold
+#   ECCENTRIC
+#     → CONCENTRIC when angle reaches depth_threshold (full depth)
+#     → NEUTRAL    if abandoned before depth (partial rep — not counted)
+#   CONCENTRIC
+#     → NEUTRAL    when angle returns to return_threshold → REP COUNTED
+#
+# Plank is excluded: it uses hold-duration tracking, not a rep cycle (REQ-4.7).
+#
+# Structure per exercise:
+#   primary_angle:       joint angle name used by the state machine (matches angle_utils keys)
+#   eccentric_threshold: angle (degrees) at which the eccentric phase begins (leaving neutral)
+#   depth_threshold:     angle (degrees) at which full depth / range of motion is reached
+#   return_threshold:    angle (degrees) at which the return-to-neutral is complete → rep counted
+
+squat:
+  primary_angle: left_knee
+  # Standing ~170°. Eccentric = knee bends (angle decreases).
+  # Starts eccentric when knee bends past 160°.
+  # Full depth at ~90° (or below 100° threshold).
+  # Rep counted when knee extends back above 160°.
+  eccentric_threshold: 160
+  depth_threshold: 100
+  return_threshold: 160
+
+push_up:
+  primary_angle: left_elbow
+  # Extended ~160°. Eccentric = elbow bends (descend), angle decreases.
+  # Starts eccentric when elbow bends past 150°.
+  # Full depth at ~90° (or below 100° threshold).
+  # Rep counted when elbow extends back above 150°.
+  eccentric_threshold: 150
+  depth_threshold: 100
+  return_threshold: 150
+
+lunge:
+  primary_angle: left_knee
+  # Standing ~170°. Eccentric = front knee bends as user steps down.
+  # Starts eccentric when knee bends past 160°.
+  # Full depth at ~90° (or below 100° threshold).
+  # Rep counted when knee extends back above 160°.
+  eccentric_threshold: 160
+  depth_threshold: 100
+  return_threshold: 160
+
+bicep_curl:
+  primary_angle: left_elbow
+  # Curled position ~40°. Eccentric = lowering (elbow extends, angle increases).
+  # Starts eccentric when elbow extends past 60° (arm starting to lower).
+  # Full depth (arm extended) at ~150°+ (threshold 150°).
+  # Rep counted (curl back up) when elbow re-flexes back to 60°.
+  # Note: for bicep curls the CONCENTRIC phase is the curl (elbow flexing);
+  #       eccentric is the lowering (elbow extending). Thresholds are inverted
+  #       compared to squat/push-up — the rep counter must treat
+  #       depth_threshold > eccentric_threshold for this exercise.
+  eccentric_threshold: 60
+  depth_threshold: 150
+  return_threshold: 60
+
+shoulder_press:
+  primary_angle: left_elbow
+  # Overhead position ~170°. Eccentric = lowering (elbow flexes, angle decreases).
+  # Starts eccentric when elbow lowers past 150° (pressing down from overhead).
+  # Full depth (lowered to shoulder height) at ~90° threshold.
+  # Rep counted (pressed back overhead) when elbow extends back above 150°.
+  eccentric_threshold: 150
+  depth_threshold: 90
+  return_threshold: 150

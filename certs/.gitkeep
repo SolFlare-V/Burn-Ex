@@ -1,0 +1,3 @@
+# Self-signed TLS certs go here.
+# Generate with: python scripts/gen_cert.py
+# local.crt and local.key are gitignored (never commit private keys).

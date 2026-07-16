@@ -1,0 +1,45 @@
+# Burn-Ex dependency deny-list
+# Packages known to make telemetry or auto-update network calls.
+# Each entry: package name (pip or npm) and reason.
+
+python:
+  - name: sentry-sdk
+    reason: "Error telemetry to sentry.io"
+  - name: bugsnag
+    reason: "Error telemetry to bugsnag.com"
+  - name: datadog
+    reason: "Metrics/telemetry to datadoghq.com"
+  - name: newrelic
+    reason: "APM telemetry to newrelic.com"
+  - name: rollbar
+    reason: "Error telemetry to rollbar.com"
+  - name: analytics-python
+    reason: "Analytics telemetry to segment.com"
+  - name: posthog
+    reason: "Product analytics telemetry"
+  - name: amplitude-analytics
+    reason: "Analytics telemetry to amplitude.com"
+  - name: mixpanel
+    reason: "Analytics telemetry to mixpanel.com"
+  - name: elastic-apm
+    reason: "APM telemetry to elastic.co"
+
+npm:
+  - name: "@sentry/react"
+    reason: "Error telemetry to sentry.io"
+  - name: "@sentry/browser"
+    reason: "Error telemetry to sentry.io"
+  - name: "analytics"
+    reason: "Analytics abstraction layer -- may phone home"
+  - name: "posthog-js"
+    reason: "Product analytics telemetry"
+  - name: "mixpanel-browser"
+    reason: "Analytics telemetry to mixpanel.com"
+  - name: "amplitude-js"
+    reason: "Analytics telemetry to amplitude.com"
+  - name: "fullstory-browser"
+    reason: "Session recording telemetry"
+  - name: "logrocket"
+    reason: "Session recording telemetry"
+  - name: "datadog-rum"
+    reason: "RUM telemetry to datadoghq.com"

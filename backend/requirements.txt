@@ -1,0 +1,12 @@
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+sqlalchemy==2.0.36
+mediapipe==0.10.18
+scikit-learn==1.5.2
+joblib==1.4.2
+numpy==1.26.4
+opencv-python==4.10.0.84
+pyyaml==6.0.2
+python-multipart==0.0.20
+websockets==13.1
+pandas==2.2.3

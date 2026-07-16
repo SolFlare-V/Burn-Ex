@@ -1,0 +1,15 @@
+# TASK-8.1 — MET (Metabolic Equivalent of Task) values per exercise type.
+# Design ref: §2.5. REQs: REQ-5.1
+#
+# Source: Ainsworth et al. exercise science compendium.
+# Formula: calories = MET × weight_kg × duration_hours
+#
+# Keys must match the exercise type strings used throughout the system
+# (as returned by the ML classifier and used in rep_phases.yaml).
+
+squat:          5.0
+push_up:        8.0
+lunge:          4.5
+bicep_curl:     3.5
+shoulder_press: 4.0
+plank:          4.0

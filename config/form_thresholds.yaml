@@ -1,0 +1,234 @@
+# TASK-6.1 — Joint angle threshold config for form/posture scoring engine.
+# Design ref: §2.3. REQs: REQ-3.1, REQ-3.2, REQ-3.7
+#
+# Structure per exercise:
+#   required_landmarks: MediaPipe landmark IDs needed for scoring
+#   thresholds:
+#     <angle_name>:
+#       min: minimum acceptable angle (degrees)
+#       max: maximum acceptable angle (degrees)
+#       cue_low:  feedback when angle < min
+#       cue_high: feedback when angle > max
+#       severity_weight: 1–3 (3 = most critical, used for sorting cues)
+#       penalty: score deduction when threshold violated (0–100)
+#   plank_checks: (plank only) static alignment checks
+
+squat:
+  required_landmarks: [23, 24, 25, 26, 27, 28]  # hips, knees, ankles
+  thresholds:
+    left_knee:
+      min: 70
+      max: 175
+      cue_low: "Squat deeper — bring knees further down"
+      cue_high: "Bend your knees more to engage the movement"
+      severity_weight: 3
+      penalty: 25
+    right_knee:
+      min: 70
+      max: 175
+      cue_low: "Squat deeper — bring knees further down"
+      cue_high: "Bend your right knee more"
+      severity_weight: 3
+      penalty: 25
+    left_hip:
+      min: 60
+      max: 175
+      cue_low: "Hip too compressed — stand taller at top"
+      cue_high: "Hinge at the hips more as you descend"
+      severity_weight: 2
+      penalty: 15
+    right_hip:
+      min: 60
+      max: 175
+      cue_low: "Hip too compressed on right side"
+      cue_high: "Hinge at the right hip more"
+      severity_weight: 2
+      penalty: 15
+    trunk:
+      min: 40
+      max: 90
+      cue_low: "Keep chest up — you're leaning too far forward"
+      cue_high: "Lean forward slightly to maintain balance"
+      severity_weight: 2
+      penalty: 20
+
+push_up:
+  required_landmarks: [11, 12, 13, 14, 15, 16, 23, 24]  # shoulders, elbows, wrists, hips
+  thresholds:
+    left_elbow:
+      min: 70
+      max: 170
+      cue_low: "Lower your chest closer to the ground"
+      cue_high: "Bend elbows more to lower your body"
+      severity_weight: 3
+      penalty: 25
+    right_elbow:
+      min: 70
+      max: 170
+      cue_low: "Lower your chest closer to the ground"
+      cue_high: "Bend right elbow more"
+      severity_weight: 3
+      penalty: 25
+    left_hip:
+      min: 160
+      max: 185
+      cue_low: "Keep hips level — don't let them sag"
+      cue_high: "Lower your hips — body should be straight"
+      severity_weight: 3
+      penalty: 30
+    trunk:
+      min: 155
+      max: 185
+      cue_low: "Keep your body in a straight line"
+      cue_high: "Straighten your body — avoid piking"
+      severity_weight: 2
+      penalty: 20
+    left_shoulder:
+      min: 30
+      max: 80
+      cue_low: "Keep shoulders directly over wrists"
+      cue_high: "Move hands closer to your body"
+      severity_weight: 1
+      penalty: 10
+
+lunge:
+  required_landmarks: [23, 24, 25, 26, 27, 28]
+  thresholds:
+    left_knee:
+      min: 80
+      max: 175
+      cue_low: "Step further forward for full lunge depth"
+      cue_high: "Bend your front knee to 90 degrees"
+      severity_weight: 3
+      penalty: 25
+    right_knee:
+      min: 80
+      max: 175
+      cue_low: "Lower your back knee closer to the floor"
+      cue_high: "Bend your back knee more"
+      severity_weight: 3
+      penalty: 25
+    left_hip:
+      min: 70
+      max: 175
+      cue_low: "Keep torso upright during lunge"
+      cue_high: "Step out further to increase hip flexion"
+      severity_weight: 2
+      penalty: 15
+    trunk:
+      min: 60
+      max: 100
+      cue_low: "Keep chest up — don't lean forward"
+      cue_high: "Lean your torso slightly forward"
+      severity_weight: 2
+      penalty: 15
+
+bicep_curl:
+  required_landmarks: [11, 12, 13, 14, 15, 16]  # shoulders, elbows, wrists
+  thresholds:
+    left_elbow:
+      min: 30
+      max: 160
+      cue_low: "Curl all the way up — squeeze your bicep"
+      cue_high: "Lower the weight fully to extend the rep"
+      severity_weight: 3
+      penalty: 20
+    right_elbow:
+      min: 30
+      max: 160
+      cue_low: "Curl right arm all the way up"
+      cue_high: "Fully extend right arm at the bottom"
+      severity_weight: 3
+      penalty: 20
+    left_shoulder:
+      min: 20
+      max: 70
+      cue_low: "Keep elbow tucked at your side"
+      cue_high: "Don't raise your shoulder — isolate the bicep"
+      severity_weight: 2
+      penalty: 15
+    right_shoulder:
+      min: 20
+      max: 70
+      cue_low: "Keep right elbow tucked at your side"
+      cue_high: "Don't raise right shoulder"
+      severity_weight: 2
+      penalty: 15
+
+shoulder_press:
+  required_landmarks: [11, 12, 13, 14, 15, 16]
+  thresholds:
+    left_elbow:
+      min: 80
+      max: 175
+      cue_low: "Press arms fully overhead"
+      cue_high: "Lower weight to shoulder height before pressing"
+      severity_weight: 3
+      penalty: 20
+    right_elbow:
+      min: 80
+      max: 175
+      cue_low: "Press right arm fully overhead"
+      cue_high: "Lower right arm to shoulder height"
+      severity_weight: 3
+      penalty: 20
+    left_shoulder:
+      min: 60
+      max: 120
+      cue_low: "Raise elbows to shoulder height before pressing"
+      cue_high: "Keep elbows in line with shoulders"
+      severity_weight: 2
+      penalty: 15
+    right_shoulder:
+      min: 60
+      max: 120
+      cue_low: "Raise right elbow to shoulder height"
+      cue_high: "Keep right elbow in line with shoulder"
+      severity_weight: 2
+      penalty: 15
+    trunk:
+      min: 160
+      max: 185
+      cue_low: "Stand tall — don't arch your lower back"
+      cue_high: "Keep core engaged and body straight"
+      severity_weight: 2
+      penalty: 20
+
+plank:
+  required_landmarks: [11, 12, 23, 24, 27, 28]  # shoulders, hips, ankles
+  thresholds:
+    left_hip:
+      min: 160
+      max: 185
+      cue_low: "Drop hips slightly — they're too high"
+      cue_high: "Raise hips — don't let them sag"
+      severity_weight: 3
+      penalty: 30
+    right_hip:
+      min: 160
+      max: 185
+      cue_low: "Drop right hip slightly"
+      cue_high: "Raise right hip — don't let it sag"
+      severity_weight: 3
+      penalty: 30
+    left_shoulder:
+      min: 40
+      max: 80
+      cue_low: "Keep shoulders directly over wrists"
+      cue_high: "Shift weight forward over your hands"
+      severity_weight: 2
+      penalty: 15
+    trunk:
+      min: 165
+      max: 185
+      cue_low: "Straighten your body — hips too high"
+      cue_high: "Engage core — body should be a straight line"
+      severity_weight: 3
+      penalty: 25
+  plank_checks:
+    hip_alignment:
+      description: "Hips level with shoulders and ankles"
+      involved_angles: [left_hip, right_hip, trunk]
+      cue: "Keep body in a straight line from head to heels"
+      severity_weight: 3
+      penalty: 25

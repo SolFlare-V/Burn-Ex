@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.venv/
+backend/venv/
+
+# Database — user data, never commit
+data/burnex.db
+
+# TLS certificates — never commit private keys
+certs/local.key
+certs/local.crt
+
+# Node
+frontend/node_modules/
+frontend/dist/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/settings.json
+.idea/
+
+# Pytest
+.pytest_cache/
+*.log
+*.tsbuildinfo
+
+# ML models — large binary files, not committed
+# (download with setup scripts)
+models/exercise_classifier.pkl
+models/efficientdet_lite0.tflite
+
+# Kiro internal
+.kiro/tasks/
+
+# Development verification scripts (not production code)
+backend/routers/verify_*.py
+backend/session/verify_*.py
