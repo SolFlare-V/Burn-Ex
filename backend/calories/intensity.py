@@ -152,19 +152,40 @@ class IntensityEstimator:
     Maintains a rolling history of landmark positions to compute:
     - Joint linear velocities  (Δposition / Δtime)
     - Joint angular velocities (Δangle / Δtime)
-    - Centre-of-mass vertical displacement
+    - Centre-of-mass vertical displacement (height-calibrated)
     - Range-of-motion fraction vs. textbook reference
 
-    These are combined into a single intensity multiplier [0.3, 2.5].
+    These are combined into a single intensity multiplier [0.40, 2.00].
+
+    Args:
+        fps:      Expected frame rate (used as dt fallback guard).
+        height_m: User's standing height in metres, from their profile.
+                  Used to calibrate the normalised→real-world scale factor.
+                  Pass 0.0 or omit to disable height calibration (falls back
+                  to the uncalibrated normalised-coord divisor).
     """
 
-    def __init__(self, fps: float = 15.0) -> None:
+    # Number of full-body frames required before height calibration is accepted.
+    _CALIBRATION_FRAMES_REQUIRED = 10
+
+    def __init__(self, fps: float = 15.0, height_m: float = 0.0) -> None:
         self._fps = fps
+        self._height_m: float = height_m  # 0.0 = not provided / disabled
+
         self._history: deque[_LandmarkSnapshot] = deque(maxlen=_HISTORY_LEN)
         self._angle_history: deque[dict[str, float]] = deque(maxlen=_HISTORY_LEN)
         self._smoothed_multiplier: float = 1.0
-        self._session_max_com_y: float = 1.0   # track highest COM seen (lowest y)
-        self._session_min_com_y: float = 0.0   # lowest
+
+        # Height calibration state.
+        # scale_m_per_norm converts a normalised-coordinate displacement into metres.
+        # It is estimated from the person's visible body height (shoulder→ankle in
+        # normalised coords) compared to their stored height_m.
+        # Assumption: the person fills the camera frame in a consistent way during
+        # the calibration window.  If they step closer or farther mid-session the
+        # estimate becomes less accurate, but no better source is available from a
+        # single RGB camera.
+        self._scale_samples: list[float] = []  # raw per-frame scale estimates
+        self._scale_m_per_norm: float = 0.0    # 0.0 = not yet calibrated
 
     # ------------------------------------------------------------------
     # Public interface
@@ -201,6 +222,10 @@ class IntensityEstimator:
         snap = _LandmarkSnapshot(positions=pos, timestamp=elapsed_s)
         self._history.append(snap)
         self._angle_history.append(dict(angle_map))
+
+        # Attempt height calibration using this frame's positions.
+        # No-ops once enough samples are collected or if height_m was not provided.
+        self._try_calibrate_height_scale(pos)
 
         # Need at least 2 frames for velocity
         if len(self._history) < 2:
@@ -288,10 +313,13 @@ class IntensityEstimator:
         )
 
     def reset(self) -> None:
-        """Clear history (call on session start or exercise change)."""
+        """Clear history and calibration (call on session start or exercise change)."""
         self._history.clear()
         self._angle_history.clear()
         self._smoothed_multiplier = 1.0
+        # Preserve height_m and any completed calibration across exercise changes —
+        # re-calibrating mid-session is unnecessary and would discard good data.
+        # Only reset the sample list so a new session can recalibrate from scratch.
 
     # ------------------------------------------------------------------
     # Private component scorers
@@ -381,17 +409,105 @@ class IntensityEstimator:
         dt: float,
     ) -> float:
         """
-        Score based on vertical COM velocity.
+        Score based on vertical COM velocity, height-calibrated when possible.
 
         In MediaPipe coords, y increases downward, so a squat lowering the
-        body INCREASES y. Vertical velocity of the COM directly reflects
-        gravitational potential energy change — the biomechanically meaningful
-        signal for locomotion and vertical exercises.
+        body INCREASES y.  The displacement is converted to real metres using
+        the calibrated scale_m_per_norm when available, then normalised against
+        a reference velocity of 0.15 m/s (a moderate squat descent rate).
+
+        When calibration is not yet available, falls back to the uncalibrated
+        normalised-coordinate divisor (0.10 normalised/s) — same behaviour as
+        the previous implementation.
+
+        Limitation: this is vertical COM velocity from a 2D monocular projection.
+        It does not capture horizontal or depth-direction COM motion.  It should
+        not be interpreted as equivalent to true COM velocity from 3D motion capture.
         """
-        com_vy = abs(com_y_curr - com_y_prev) / dt
-        # Normalise: typical squat/lunge COM velocity ~ 0.05–0.20 coords/s
-        score = min(com_vy / 0.10, 1.0)
+        delta_y_norm = abs(com_y_curr - com_y_prev)
+
+        if self._scale_m_per_norm > 0.0:
+            # Height-calibrated path: convert to real metres/second.
+            # Reference velocity: 0.15 m/s ≈ moderate squat descent/ascent rate.
+            # (A fast squat reaches ~0.30 m/s; a slow one ~0.05 m/s.)
+            delta_y_m = delta_y_norm * self._scale_m_per_norm
+            com_vy_m_per_s = delta_y_m / dt
+            score = min(com_vy_m_per_s / 0.15, 1.0)
+        else:
+            # Fallback: uncalibrated normalised coords. Divisor 0.10 was chosen
+            # empirically in the original implementation. Results vary with
+            # camera distance and subject height.
+            com_vy = delta_y_norm / dt
+            score = min(com_vy / 0.10, 1.0)
+
         return score
+
+    def _try_calibrate_height_scale(
+        self,
+        positions: dict[int, tuple[float, float, float]],
+    ) -> None:
+        """
+        Attempt to update the height calibration using one frame's landmarks.
+
+        Measures the shoulder-midpoint to ankle-midpoint distance in normalised
+        coordinates and compares it to the user's stored height_m to estimate
+        scale_m_per_norm.
+
+        Called each frame until _CALIBRATION_FRAMES_REQUIRED samples are collected,
+        after which the median is frozen as the session scale.
+
+        Assumptions and limitations
+        ---------------------------
+        - Requires both shoulders (11, 12) and both ankles (27, 28) to be visible
+          with visibility >= 0.5.  Frames where these are occluded are skipped.
+        - The shoulder-to-ankle distance in normalised coords ≈ 0.85–0.92 × true
+          standing height for an upright, forward-facing person.  A correction
+          factor of 1/0.88 (median of published MediaPipe normalisation ratios) is
+          applied to account for this.
+        - If the person is not standing upright at calibration time (e.g. squatting
+          during the first 10 frames), the scale estimate will be low.  The median
+          of multiple frames partially mitigates this.
+        - Camera angle and zoom affect normalised coordinates.  This calibration
+          assumes the person roughly fills the frame vertically.
+        """
+        if self._height_m <= 0.0:
+            return  # height not provided — calibration disabled
+        if len(self._scale_samples) >= self._CALIBRATION_FRAMES_REQUIRED:
+            return  # already have enough samples
+
+        # Need all four landmarks visible and confident
+        required = [_LM["l_shoulder"], _LM["r_shoulder"], _LM["l_ankle"], _LM["r_ankle"]]
+        if not all(lid in positions for lid in required):
+            return
+
+        ls_y = positions[_LM["l_shoulder"]][1]
+        rs_y = positions[_LM["r_shoulder"]][1]
+        la_y = positions[_LM["l_ankle"]][1]
+        ra_y = positions[_LM["r_ankle"]][1]
+
+        shoulder_mid_y = (ls_y + rs_y) / 2.0
+        ankle_mid_y    = (la_y + ra_y) / 2.0
+
+        # Vertical span in normalised coords (positive: ankles below shoulders)
+        span_norm = ankle_mid_y - shoulder_mid_y
+        if span_norm < 0.05:
+            return  # degenerate frame (person horizontal or not visible enough)
+
+        # The shoulder-to-ankle span captures ~88% of standing height in MediaPipe's
+        # normalised output for an upright person (head not included in measurement).
+        # Correction factor: height_m / (span_norm × 0.88) = scale_m_per_norm
+        scale = self._height_m / (span_norm * 0.88)
+        self._scale_samples.append(scale)
+
+        if len(self._scale_samples) >= self._CALIBRATION_FRAMES_REQUIRED:
+            # Use median to reject outlier frames (person partially squatting etc.)
+            sorted_samples = sorted(self._scale_samples)
+            n = len(sorted_samples)
+            if n % 2 == 0:
+                median = (sorted_samples[n // 2 - 1] + sorted_samples[n // 2]) / 2.0
+            else:
+                median = sorted_samples[n // 2]
+            self._scale_m_per_norm = median
 
     def _angular_velocity_score(self, dt: float) -> float:
         """

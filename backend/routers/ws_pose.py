@@ -65,7 +65,7 @@ _CLOSE_CODE_INVALID = 4001    # custom close code: invalid/missing session_id
 class _SessionState:
     """Holds all mutable per-session processing state."""
 
-    def __init__(self, session_id: str, weight_kg: float) -> None:
+    def __init__(self, session_id: str, weight_kg: float, height_cm: float = 0.0) -> None:
         self.session_id = session_id
         self.weight_kg = weight_kg
 
@@ -74,7 +74,10 @@ class _SessionState:
         self.rep_counter = RepCounter()
         self.form_tracker = SetFormTracker()
         self.calorie_engine = CalorieEngine(weight_kg=weight_kg)
-        self.intensity_estimator = IntensityEstimator(fps=15.0)
+        # height_m is used by IntensityEstimator for height-calibrated COM scaling.
+        # Falls back gracefully to uncalibrated mode if 0.0 (height not stored).
+        height_m = (height_cm / 100.0) if (height_cm and height_cm > 0) else 0.0
+        self.intensity_estimator = IntensityEstimator(fps=15.0, height_m=height_m)
 
         # Current smoothed intensity multiplier (updated every frame)
         self.intensity_multiplier: float = 1.0
@@ -93,8 +96,13 @@ class _SessionState:
 # Helper: resolve active session weight from DB
 # ---------------------------------------------------------------------------
 
-def _get_session_weight(session_id: str) -> Optional[float]:
-    """Return weight_kg for session_id's user, or None if not found/not active."""
+def _get_session_weight(session_id: str) -> Optional[tuple[float, float]]:
+    """
+    Return (weight_kg, height_cm) for session_id's user, or None if not found/active.
+
+    height_cm may be None in the DB (field added later); defaults to 0.0 so
+    the caller can pass it to _SessionState without a None-check.
+    """
     from backend.database import SessionLocal
     from backend.models.sessions import Session
     from backend.models.users import User
@@ -107,7 +115,9 @@ def _get_session_weight(session_id: str) -> Optional[float]:
         user = db.query(User).filter(User.id == row.user_id).first()
         if user is None:
             return None
-        return float(user.weight_kg)
+        weight = float(user.weight_kg)
+        height = float(user.height_cm) if getattr(user, "height_cm", None) else 0.0
+        return weight, height
     finally:
         db.close()
 
@@ -174,16 +184,17 @@ async def ws_pose(websocket: WebSocket):
         logger.info("WS rejected: missing session_id")
         return
 
-    weight_kg = _get_session_weight(session_id)
-    if weight_kg is None:
+    result = _get_session_weight(session_id)
+    if result is None:
         await websocket.close(code=_CLOSE_CODE_INVALID)
         logger.info("WS rejected: session_id=%s not active", session_id)
         return
+    weight_kg, height_cm = result
 
     await websocket.accept()
     logger.info("WS accepted: session_id=%s weight=%.1f", session_id, weight_kg)
 
-    state = _SessionState(session_id=session_id, weight_kg=weight_kg)
+    state = _SessionState(session_id=session_id, weight_kg=weight_kg, height_cm=height_cm)
     stop_event = asyncio.Event()
 
     # Start heartbeat as a background task
@@ -451,6 +462,7 @@ async def _process_frame_message(
         # Intensity fields — dynamic calorie multiplier and component scores
         "_intensity_multiplier": round(state.intensity_multiplier, 3),
         "_intensity_is_resting": intensity_result.is_resting,
+        "_intensity_height_scale": round(state.intensity_estimator._scale_m_per_norm, 4),
     }
 
 
