@@ -35,6 +35,7 @@ from fastapi.routing import APIRouter
 from backend.calories.engine import CalorieEngine
 from backend.calories.intensity import IntensityEstimator
 from backend.cv.pipeline import process_frame
+from backend.identity.manager import PersonSessionManager
 from backend.ml.pipeline import MLPipeline
 from backend.reps.counter import RepCounter
 from backend.scoring.engine import score_frame
@@ -49,6 +50,75 @@ router = APIRouter()
 # Running these on the asyncio event loop thread blocked frame reception,
 # causing a backlog of stale frames that processed long after movement stopped.
 _cpu_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="cv_worker")
+
+# ---------------------------------------------------------------------------
+# Per-session person state cache (for /api/v1/persons query)
+# Maps session_id → PersonSessionManager so the REST endpoint can read it.
+# ---------------------------------------------------------------------------
+_session_person_managers: dict[str, "PersonSessionManager"] = {}
+
+
+# ---------------------------------------------------------------------------
+# REST endpoint — persons summary (History / Sessions page)
+# ---------------------------------------------------------------------------
+
+from fastapi import Query
+from fastapi.responses import JSONResponse
+
+@router.get("/api/v1/persons")
+async def get_persons(session_id: str = Query(...)):
+    """
+    Return all detected persons and their set history for the given session.
+    Used by the History/Sessions UI page.
+
+    Response shape:
+      {
+        "active_person_id": "uuid|null",
+        "persons": [
+          {
+            "person_id": "uuid",
+            "display_name": "Person 1",
+            "first_seen_at": 1720000000.0,
+            "last_seen_at":  1720000120.0,
+            "total_calories": 42.3,
+            "total_reps": 30,
+            "sets": [
+              { "set_number":1, "exercise":"squat", "reps":10,
+                "calories":8.2, "avg_form_score":81.0,
+                "timestamp":1720000050.0, "partial":false },
+              ...
+            ]
+          },
+          ...
+        ]
+      }
+    """
+    mgr = _session_person_managers.get(session_id)
+    if mgr is None:
+        return JSONResponse({"active_person_id": None, "persons": []})
+
+    active_state = mgr.get_active_state()
+    active_id = active_state.person_id if active_state else None
+
+    # Include live running calorie estimate for the active person
+    persons = []
+    for ps in mgr.get_all_states():
+        summary = ps.to_summary_dict()
+        # For the active person, include the live running estimate
+        if ps.person_id == active_id and ps.segment_open:
+            summary["total_calories"] = round(
+                ps.calorie_engine.running_estimate(
+                    time.time(),
+                    intensity_multiplier=ps.intensity_multiplier,
+                ),
+                3,
+            )
+        persons.append(summary)
+
+    return JSONResponse({
+        "active_person_id": active_id,
+        "persons": persons,
+    })
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -90,6 +160,16 @@ class _SessionState:
 
         # Timing
         self.last_frame_ts: float = time.monotonic()
+
+        # Person identification manager (Step 4).
+        # Runs InsightFace in a background thread every ~25 frames.
+        # The calorie engine and per-frame pipeline state above are the
+        # *fallback* single-user state used when the manager has no active
+        # person yet (first ~2s before first identification completes).
+        self.person_manager = PersonSessionManager(
+            weight_kg=weight_kg,
+            height_cm=height_cm,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -195,6 +275,10 @@ async def ws_pose(websocket: WebSocket):
     logger.info("WS accepted: session_id=%s weight=%.1f", session_id, weight_kg)
 
     state = _SessionState(session_id=session_id, weight_kg=weight_kg, height_cm=height_cm)
+
+    # Register manager in the global cache so /api/v1/persons can read it
+    _session_person_managers[session_id] = state.person_manager
+
     stop_event = asyncio.Event()
 
     # Start heartbeat as a background task
@@ -268,6 +352,8 @@ async def ws_pose(websocket: WebSocket):
             await heartbeat_task
         except asyncio.CancelledError:
             pass
+        # Remove manager from global cache
+        _session_person_managers.pop(session_id, None)
         logger.info("WS handler exited: session_id=%s", session_id)
 
 
@@ -309,12 +395,40 @@ async def _process_frame_message(
 
     t_start = time.monotonic()
 
+    # --- Person identification tick (Step 4) ---
+    # Runs InsightFace in the background thread pool every ~25 frames.
+    # Returns the active person_id (may be None for first ~2s).
+    # Does NOT block the frame pipeline — identification is async.
+    loop = asyncio.get_event_loop()
+    active_person_id = state.person_manager.tick(jpeg_bytes, loop, _cpu_executor)
+    active_ps = state.person_manager.get_active_state()
+
+    # If a person is identified, use their per-person pipeline components;
+    # otherwise fall back to the top-level _SessionState components.
+    # The calorie engine and all stateful components are independent per person.
+    if active_ps is not None:
+        ml_pipeline      = active_ps.ml_pipeline
+        rep_counter      = active_ps.rep_counter
+        form_tracker     = active_ps.form_tracker
+        calorie_engine   = active_ps.calorie_engine
+        intensity_est    = active_ps.intensity_estimator
+        person_weight    = active_ps.weight_kg
+        segment_open_ref = active_ps   # mutable attrs read/written via active_ps
+    else:
+        # No person confirmed yet — use session-level fallback
+        ml_pipeline      = state.ml_pipeline
+        rep_counter      = state.rep_counter
+        form_tracker     = state.form_tracker
+        calorie_engine   = state.calorie_engine
+        intensity_est    = state.intensity_estimator
+        person_weight    = state.weight_kg
+        segment_open_ref = state
+
     # --- Stage 1: CV pipeline (run in thread pool so event loop stays free) ---
     # Previously this ran synchronously on the event loop thread, blocking
     # frame reception for ~80-120ms per frame. Frames queued in the OS socket
     # buffer and processed long after the user stopped moving.
-    loop = asyncio.get_event_loop()
-    exercise_for_cv = state.last_confirmed_type
+    exercise_for_cv = segment_open_ref.last_confirmed_type
     processed = await loop.run_in_executor(
         _cpu_executor,
         process_frame,
@@ -324,24 +438,23 @@ async def _process_frame_message(
 
     # Notify calorie engine that a real frame arrived (gates idle detection).
     current_ts = time.time()
-    state.calorie_engine.notify_frame(current_ts)
+    calorie_engine.notify_frame(current_ts)
 
     # If no person is detected (screen black, camera covered) close any open
     # calorie segment so calories stop accumulating during the blackout.
     if processed.occluded and not processed.landmarks:
-        if state.segment_open and state.calorie_engine._open_segment is not None:
-            state.calorie_engine.close_segment(
+        if segment_open_ref.segment_open and calorie_engine._open_segment is not None:
+            calorie_engine.close_segment(
                 current_ts,
-                intensity_multiplier=state.intensity_multiplier,
-                class_probabilities=classification.class_probabilities,
+                intensity_multiplier=segment_open_ref.intensity_multiplier,
             )
-            state.segment_open = False
+            segment_open_ref.segment_open = False
             logger.debug("Calorie segment closed: no person in frame (session %s)", state.session_id)
 
     # --- Stage 2: ML classification (also in thread pool) ---
     classification = await loop.run_in_executor(
         _cpu_executor,
-        state.ml_pipeline.classify_frame,
+        ml_pipeline.classify_frame,
         processed.angle_map,
         elapsed_seconds,
     )
@@ -350,77 +463,73 @@ async def _process_frame_message(
     # --- TASK-10.3: Exercise-change handling ---
     if (
         confirmed_type is not None
-        and confirmed_type != state.last_confirmed_type
+        and confirmed_type != segment_open_ref.last_confirmed_type
     ):
         _handle_exercise_change(
-            confirmed_type, state,
+            confirmed_type, segment_open_ref,
+            calorie_engine=calorie_engine,
+            intensity_est=intensity_est,
             class_probabilities=classification.class_probabilities,
         )
 
-    # --- Drop-out handling: classification returned None after being confirmed ---
-    # When the camera blacks out or the person leaves frame, the confirmation
-    # window will return None. Close the open calorie segment so calories stop
-    # accumulating, and clear last_confirmed_type so we don't keep using a
-    # stale exercise label.
-    elif confirmed_type is None and state.last_confirmed_type is not None:
+    # --- Drop-out handling ---
+    elif confirmed_type is None and segment_open_ref.last_confirmed_type is not None:
         ts = time.time()
-        if state.segment_open:
+        if segment_open_ref.segment_open:
             try:
-                state.calorie_engine.close_segment(
+                calorie_engine.close_segment(
                     ts,
-                    intensity_multiplier=state.intensity_multiplier,
+                    intensity_multiplier=segment_open_ref.intensity_multiplier,
                     class_probabilities=classification.class_probabilities,
                 )
             except RuntimeError:
                 pass
-            state.segment_open = False
-        state.last_confirmed_type = None
+            segment_open_ref.segment_open = False
+        segment_open_ref.last_confirmed_type = None
 
     # --- Stage 3: Intensity estimation ---
-    intensity_result = state.intensity_estimator.update(
+    intensity_result = intensity_est.update(
         landmarks=processed.landmarks or [],
         angle_map=processed.angle_map,
         exercise_type=confirmed_type,
         elapsed_s=elapsed_seconds,
         classifier_confidence=classification.confidence,
-        weight_kg=state.weight_kg,
+        weight_kg=person_weight,
     )
-    state.intensity_multiplier = intensity_result.multiplier
+    segment_open_ref.intensity_multiplier = intensity_result.multiplier
 
     # --- Stage 4: Form scoring ---
     scoring = score_frame(processed, confirmed_type)
 
     # --- Stage 5: Rep counting ---
-    rep_state = state.rep_counter.update_rep_state(
+    rep_state = rep_counter.update_rep_state(
         processed.angle_map, confirmed_type, elapsed_seconds
     )
 
     # --- Stage 6: Calorie running estimate ---
-    # Pass class_probabilities for confidence-weighted MET (P1-I2).
-    # Pass general_activity_met for unclassified movement calories (P1-I4).
-    calories_running = state.calorie_engine.running_estimate(
+    calories_running = calorie_engine.running_estimate(
         current_ts,
-        intensity_multiplier=state.intensity_multiplier,
+        intensity_multiplier=segment_open_ref.intensity_multiplier,
         class_probabilities=classification.class_probabilities,
         general_activity_met=intensity_result.general_activity_met,
     )
 
     # General activity calories when no segment is open (P1-I4).
-    # Accumulate per-frame contribution directly onto closed_total proxy.
-    if not state.segment_open and intensity_result.general_activity_met > 0.0:
+    if not segment_open_ref.segment_open and intensity_result.general_activity_met > 0.0:
         elapsed_h = elapsed_seconds / 3600.0
         calories_running += (
-            intensity_result.general_activity_met * state.weight_kg * elapsed_h
+            intensity_result.general_activity_met * person_weight * elapsed_h
         )
 
-    # --- Update session manager state cache for persistence/interrupt ---
+    # --- Add form score sample (only when not occluded and type confirmed) ---
+    # --- Update session manager state cache ---
     session_manager.update_state_cache(
-        rep_state, state.calorie_engine, state.form_tracker
+        rep_state, calorie_engine, form_tracker
     )
 
-    # --- Add form score sample (only when not occluded and type confirmed) ---
+    # --- Add form score sample ---
     if not processed.occluded and confirmed_type is not None:
-        state.form_tracker.add_sample(scoring.score)
+        form_tracker.add_sample(scoring.score)
 
     t_end = time.monotonic()
     latency_ms = (t_end - t_start) * 1000.0
@@ -486,14 +595,18 @@ async def _process_frame_message(
         "capture_ts_echo": capture_ts_echo,
         "_confidence": round(classification.confidence, 3),
         "_angle_count": len(processed.angle_map),
-        "_intensity_multiplier": round(state.intensity_multiplier, 3),
+        "_intensity_multiplier": round(segment_open_ref.intensity_multiplier, 3),
         "_intensity_is_resting": intensity_result.is_resting,
         "_intensity_is_static": intensity_result.is_static_hold,
-        "_intensity_height_scale": round(state.intensity_estimator._scale_m_per_norm, 4),
+        "_intensity_height_scale": round(intensity_est._scale_m_per_norm, 4),
         "_weighted_met": round(_wmet, 3),
         "_fatigue_index": round(intensity_result.fatigue_index, 3),
         "_symmetry_index": round(intensity_result.symmetry_index, 3),
         "_general_activity_met": round(intensity_result.general_activity_met, 2),
+        # Person identification fields (Step 4)
+        "active_person_id": active_person_id,
+        "active_person_name": active_ps.display_name if active_ps else None,
+        "person_count": state.person_manager.person_count(),
     }
 
 
@@ -503,30 +616,39 @@ async def _process_frame_message(
 
 def _handle_exercise_change(
     new_type: str,
-    state: _SessionState,
+    state_ref,   # _SessionState or PersonSessionState — duck-typed
+    calorie_engine=None,
+    intensity_est=None,
     class_probabilities: Optional[dict[str, float]] = None,
 ) -> None:
     """
     Handle a confirmed exercise-type transition.
-    Passes class_probabilities to close_segment for confidence-weighted MET.
+
+    Accepts either a _SessionState or PersonSessionState via duck-typing.
+    calorie_engine and intensity_est are passed explicitly so the per-person
+    components are used rather than the fallback session-level ones.
     """
+    # Resolve components — explicit params take priority over state attributes
+    _ce = calorie_engine if calorie_engine is not None else state_ref.calorie_engine
+    _ie = intensity_est if intensity_est is not None else state_ref.intensity_estimator
+
     ts = time.time()
 
-    if state.segment_open:
-        state.calorie_engine.change_exercise(
+    if state_ref.segment_open:
+        _ce.change_exercise(
             new_type,
             ts,
-            intensity_multiplier=state.intensity_multiplier,
+            intensity_multiplier=state_ref.intensity_multiplier,
             class_probabilities=class_probabilities,
         )
-        state.intensity_estimator.reset()
+        _ie.reset()
         logger.info(
-            "Exercise change: %s → %s (session %s)",
-            state.last_confirmed_type, new_type, state.session_id,
+            "Exercise change: %s → %s",
+            state_ref.last_confirmed_type, new_type,
         )
     else:
-        state.calorie_engine.start_segment(new_type, ts)
-        state.segment_open = True
-        logger.info("Exercise started: %s (session %s)", new_type, state.session_id)
+        _ce.start_segment(new_type, ts)
+        state_ref.segment_open = True
+        logger.info("Exercise started: %s", new_type)
 
-    state.last_confirmed_type = new_type
+    state_ref.last_confirmed_type = new_type
