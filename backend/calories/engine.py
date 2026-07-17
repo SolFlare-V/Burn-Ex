@@ -52,6 +52,29 @@ def _load_met_values() -> dict[str, float]:
     return {k: float(v) for k, v in data.items()}
 
 
+def _compute_weighted_met(class_probabilities: dict[str, float]) -> float:
+    """
+    Compute a probability-weighted MET value from a full class distribution.
+
+    Returns Σ P(class_i) × MET_i for all classes present in met_values.yaml.
+    This is an approximation used to smooth calorie estimates during borderline
+    classifications — it reduces abrupt MET jumps when the classifier is
+    uncertain between two exercises with different MET values.
+
+    Returns 0.0 if class_probabilities is empty (caller falls through to
+    standard single-class MET lookup).
+    """
+    if not class_probabilities:
+        return 0.0
+    met = _load_met_values()
+    weighted = sum(
+        prob * met[cls]
+        for cls, prob in class_probabilities.items()
+        if cls in met
+    )
+    return weighted
+
+
 # ---------------------------------------------------------------------------
 # CalorieSegment
 # ---------------------------------------------------------------------------
@@ -159,16 +182,25 @@ class CalorieEngine:
         self,
         timestamp: float,
         intensity_multiplier: float = 1.0,
-    ) -> CalorieSegment:
+        class_probabilities: Optional[dict[str, float]] = None,
+    ) -> "CalorieSegment":
         """
         Close the currently open segment, compute its calories, and return it.
 
         calories = MET[exercise] × weight_kg × duration_hours × intensity_multiplier
 
+        When class_probabilities is provided and non-empty, a confidence-weighted
+        MET (Σ P(class_i) × MET_i) is used instead of the single-class MET.
+        This reduces abrupt MET jumps during borderline classifications where
+        the classifier is uncertain between two exercises with different base METs.
+
         Args:
             timestamp:           Time when the segment ends.
             intensity_multiplier: Movement-intensity scaling factor from
                                   IntensityEstimator (default 1.0 = standard MET).
+            class_probabilities: Full classifier probability distribution over
+                                 exercise classes (optional). When provided and
+                                 non-empty, overrides the single-class MET lookup.
 
         Returns:
             The closed ``CalorieSegment`` with ``calories`` and
@@ -184,7 +216,14 @@ class CalorieEngine:
         duration_s = max(0.0, timestamp - seg.start_time)
         duration_hours = duration_s / 3600.0
 
-        met = _load_met_values()[seg.exercise_type]
+        # Use confidence-weighted MET when a full distribution is available;
+        # otherwise fall back to the single top-class MET value.
+        weighted = _compute_weighted_met(class_probabilities or {})
+        if weighted > 0.0:
+            met = weighted
+        else:
+            met = _load_met_values()[seg.exercise_type]
+
         # Floor matches the minimum from IntensityEstimator (_MIN_MULTIPLIER = 0.40).
         multiplier = max(0.40, float(intensity_multiplier))
         calories = met * seg.weight_kg * duration_hours * multiplier
@@ -219,19 +258,29 @@ class CalorieEngine:
         self,
         current_timestamp: float,
         intensity_multiplier: float = 1.0,
+        class_probabilities: Optional[dict[str, float]] = None,
+        general_activity_met: float = 0.0,
     ) -> float:
         """
         Live calorie total: closed segments + provisional open segment.
 
         Calories only accumulate up to the last received frame timestamp.
-        If no frame has arrived within IDLE_PAUSE_THRESHOLD seconds (screen
-        black, camera covered, tab hidden), the open-segment contribution is
-        frozen so calories do not keep growing with wall-clock time.
+        If no frame has arrived within IDLE_PAUSE_THRESHOLD seconds the
+        open-segment contribution is frozen.
+
+        When class_probabilities is provided and non-empty, a confidence-weighted
+        MET (Σ P(class_i) × MET_i) is used in the provisional estimate.
+
+        When general_activity_met > 0 and no exercise segment is open, a
+        provisional general-activity calorie contribution is added.
+        This uses Ainsworth-style MET tiers from total body motion velocity and
+        is a coarse approximation from monocular RGB pose data.
 
         Args:
-            current_timestamp:   Current time (same clock used for notify_frame).
-            intensity_multiplier: Movement-intensity scaling factor from
-                                  IntensityEstimator for the provisional estimate.
+            current_timestamp:    Current time (same clock used for notify_frame).
+            intensity_multiplier: Movement-intensity scaling factor.
+            class_probabilities:  Full classifier probability distribution (optional).
+            general_activity_met: MET estimate for unclassified movement (optional).
 
         Returns:
             Total estimated calories burned so far (float).
@@ -239,8 +288,6 @@ class CalorieEngine:
         closed_total = self.running_total()
 
         seg = self._open_segment
-        if seg is None:
-            return closed_total
 
         # No frames ever received, or no frame recently — freeze accumulation.
         if self._last_frame_ts is None:
@@ -249,10 +296,27 @@ class CalorieEngine:
         if idle_s > self.IDLE_PAUSE_THRESHOLD:
             return closed_total
 
+        if seg is None:
+            # No exercise segment open — add general activity contribution if available.
+            if general_activity_met > 0.0:
+                elapsed_s = max(0.0, self._last_frame_ts - (self._last_frame_ts - 1.0))
+                # Use a single-frame contribution: met * weight * (1/3600)
+                # Caller is expected to accumulate this per frame rather than
+                # computing a segment duration here.
+                pass  # general activity is accumulated per-frame in ws_pose.py
+            return closed_total
+
         # Accumulate only up to the last real frame, not wall clock.
         elapsed_s = max(0.0, self._last_frame_ts - seg.start_time)
         elapsed_hours = elapsed_s / 3600.0
-        met = _load_met_values()[seg.exercise_type]
+
+        # Use confidence-weighted MET when available.
+        weighted = _compute_weighted_met(class_probabilities or {})
+        if weighted > 0.0:
+            met = weighted
+        else:
+            met = _load_met_values()[seg.exercise_type]
+
         # Floor matches the minimum from IntensityEstimator (_MIN_MULTIPLIER = 0.40).
         multiplier = max(0.40, float(intensity_multiplier))
         provisional = met * seg.weight_kg * elapsed_hours * multiplier
@@ -268,6 +332,7 @@ class CalorieEngine:
         new_exercise_type: str,
         timestamp: float,
         intensity_multiplier: float = 1.0,
+        class_probabilities: Optional[dict[str, float]] = None,
     ) -> None:
         """
         Atomically close the current segment and open a new one.
@@ -276,9 +341,11 @@ class CalorieEngine:
         *new_exercise_type* (handles the session-start edge case gracefully).
 
         Args:
-            new_exercise_type:   The exercise type to transition to.
-            timestamp:           Time of the exercise change event.
+            new_exercise_type:    The exercise type to transition to.
+            timestamp:            Time of the exercise change event.
             intensity_multiplier: Movement-intensity scaling factor applied to
+                                  the closing segment's final calorie calculation.
+            class_probabilities:  Full classifier probability distribution for
                                   the closing segment's final calorie calculation.
 
         Raises:
@@ -292,7 +359,11 @@ class CalorieEngine:
             )
 
         if self._open_segment is not None:
-            self.close_segment(timestamp, intensity_multiplier=intensity_multiplier)
+            self.close_segment(
+                timestamp,
+                intensity_multiplier=intensity_multiplier,
+                class_probabilities=class_probabilities,
+            )
 
         self.start_segment(new_exercise_type, timestamp)
 

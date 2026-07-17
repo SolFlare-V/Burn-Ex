@@ -331,7 +331,9 @@ async def _process_frame_message(
     if processed.occluded and not processed.landmarks:
         if state.segment_open and state.calorie_engine._open_segment is not None:
             state.calorie_engine.close_segment(
-                current_ts, intensity_multiplier=state.intensity_multiplier
+                current_ts,
+                intensity_multiplier=state.intensity_multiplier,
+                class_probabilities=classification.class_probabilities,
             )
             state.segment_open = False
             logger.debug("Calorie segment closed: no person in frame (session %s)", state.session_id)
@@ -350,7 +352,10 @@ async def _process_frame_message(
         confirmed_type is not None
         and confirmed_type != state.last_confirmed_type
     ):
-        _handle_exercise_change(confirmed_type, state)
+        _handle_exercise_change(
+            confirmed_type, state,
+            class_probabilities=classification.class_probabilities,
+        )
 
     # --- Drop-out handling: classification returned None after being confirmed ---
     # When the camera blacks out or the person leaves frame, the confirmation
@@ -362,7 +367,9 @@ async def _process_frame_message(
         if state.segment_open:
             try:
                 state.calorie_engine.close_segment(
-                    ts, intensity_multiplier=state.intensity_multiplier
+                    ts,
+                    intensity_multiplier=state.intensity_multiplier,
+                    class_probabilities=classification.class_probabilities,
                 )
             except RuntimeError:
                 pass
@@ -370,13 +377,13 @@ async def _process_frame_message(
         state.last_confirmed_type = None
 
     # --- Stage 3: Intensity estimation ---
-    # Run after classification so exercise_type is known.
-    # elapsed_seconds is used as dt for velocity calculations.
     intensity_result = state.intensity_estimator.update(
         landmarks=processed.landmarks or [],
         angle_map=processed.angle_map,
         exercise_type=confirmed_type,
         elapsed_s=elapsed_seconds,
+        classifier_confidence=classification.confidence,
+        weight_kg=state.weight_kg,
     )
     state.intensity_multiplier = intensity_result.multiplier
 
@@ -389,9 +396,22 @@ async def _process_frame_message(
     )
 
     # --- Stage 6: Calorie running estimate ---
+    # Pass class_probabilities for confidence-weighted MET (P1-I2).
+    # Pass general_activity_met for unclassified movement calories (P1-I4).
     calories_running = state.calorie_engine.running_estimate(
-        current_ts, intensity_multiplier=state.intensity_multiplier
+        current_ts,
+        intensity_multiplier=state.intensity_multiplier,
+        class_probabilities=classification.class_probabilities,
+        general_activity_met=intensity_result.general_activity_met,
     )
+
+    # General activity calories when no segment is open (P1-I4).
+    # Accumulate per-frame contribution directly onto closed_total proxy.
+    if not state.segment_open and intensity_result.general_activity_met > 0.0:
+        elapsed_h = elapsed_seconds / 3600.0
+        calories_running += (
+            intensity_result.general_activity_met * state.weight_kg * elapsed_h
+        )
 
     # --- Update session manager state cache for persistence/interrupt ---
     session_manager.update_state_cache(
@@ -444,6 +464,12 @@ async def _process_frame_message(
                 "visibility": round(getattr(lm, "visibility", 0.0), 4),
             })
 
+    # Compute weighted MET for debug output
+    from backend.calories.engine import _compute_weighted_met, _load_met_values
+    _wmet = _compute_weighted_met(classification.class_probabilities)
+    if _wmet <= 0.0 and confirmed_type:
+        _wmet = _load_met_values().get(confirmed_type, 0.0)
+
     return {
         "exercise": confirmed_type,
         "rep_count": rep_state.rep_count,
@@ -451,18 +477,23 @@ async def _process_frame_message(
         "form_score": scoring.score,
         "corrections": scoring.cues,
         "calories_running": round(calories_running, 4),
+        "calorie_confidence": round(intensity_result.calorie_confidence, 3),
+        "calorie_ci_lower": round(calories_running * (1 - intensity_result.calorie_ci_relative_error), 3),
+        "calorie_ci_upper": round(calories_running * (1 + intensity_result.calorie_ci_relative_error), 3),
         "warning": warning,
         "landmarks": landmarks_out,
         "latency_ms": round(latency_ms, 1),
-        # Timing instrumentation — echoed to client for capture→receive gap calc
         "capture_ts_echo": capture_ts_echo,
-        # Debug fields — visible in browser console
         "_confidence": round(classification.confidence, 3),
         "_angle_count": len(processed.angle_map),
-        # Intensity fields — dynamic calorie multiplier and component scores
         "_intensity_multiplier": round(state.intensity_multiplier, 3),
         "_intensity_is_resting": intensity_result.is_resting,
+        "_intensity_is_static": intensity_result.is_static_hold,
         "_intensity_height_scale": round(state.intensity_estimator._scale_m_per_norm, 4),
+        "_weighted_met": round(_wmet, 3),
+        "_fatigue_index": round(intensity_result.fatigue_index, 3),
+        "_symmetry_index": round(intensity_result.symmetry_index, 3),
+        "_general_activity_met": round(intensity_result.general_activity_met, 2),
     }
 
 
@@ -470,33 +501,32 @@ async def _process_frame_message(
 # TASK-10.3 — Exercise-change handler
 # ---------------------------------------------------------------------------
 
-def _handle_exercise_change(new_type: str, state: _SessionState) -> None:
+def _handle_exercise_change(
+    new_type: str,
+    state: _SessionState,
+    class_probabilities: Optional[dict[str, float]] = None,
+) -> None:
     """
     Handle a confirmed exercise-type transition.
-
-    - Closes the open calorie segment and opens a new one for new_type.
-    - SetTracker.exercise_changed() is called inside RepCounter already.
-    - Updates state.last_confirmed_type.
+    Passes class_probabilities to close_segment for confidence-weighted MET.
     """
     ts = time.time()
 
     if state.segment_open:
-        # Close current segment (with accumulated intensity multiplier) and open new one
         state.calorie_engine.change_exercise(
-            new_type, ts, intensity_multiplier=state.intensity_multiplier
+            new_type,
+            ts,
+            intensity_multiplier=state.intensity_multiplier,
+            class_probabilities=class_probabilities,
         )
-        # Reset intensity history when exercise changes
         state.intensity_estimator.reset()
         logger.info(
             "Exercise change: %s → %s (session %s)",
             state.last_confirmed_type, new_type, state.session_id,
         )
     else:
-        # First exercise confirmation this session — open initial segment
         state.calorie_engine.start_segment(new_type, ts)
         state.segment_open = True
-        logger.info(
-            "Exercise started: %s (session %s)", new_type, state.session_id
-        )
+        logger.info("Exercise started: %s (session %s)", new_type, state.session_id)
 
     state.last_confirmed_type = new_type

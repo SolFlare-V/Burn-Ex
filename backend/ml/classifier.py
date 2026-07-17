@@ -111,6 +111,35 @@ def predict(
     return (class_name, max_prob)
 
 
+def predict_proba(
+    feature_vector: np.ndarray | None,
+) -> dict[str, float]:
+    """
+    Return the full class probability distribution from the classifier.
+
+    Used by the calorie engine for confidence-weighted MET calculation.
+    When the classifier is uncertain between classes, the weighted MET
+    (Σ P(class_i) × MET_i) produces smoother calorie estimates than
+    hard-assigning the top class.
+
+    Args:
+        feature_vector: numpy array of shape (10,) or None.
+
+    Returns:
+        Dict mapping each exercise class to its predicted probability.
+        Returns an empty dict if the model is not loaded or input is None.
+    """
+    if feature_vector is None or not _MODEL_LOADED or _clf is None:
+        return {}
+
+    vec = feature_vector.reshape(1, -1)
+    proba = _clf.predict_proba(vec)[0]
+    return {
+        str(_clf.classes_[i]): float(proba[i])
+        for i in range(len(_clf.classes_))
+    }
+
+
 def is_model_loaded() -> bool:
     """Return True if the classifier model was loaded successfully."""
     return _MODEL_LOADED

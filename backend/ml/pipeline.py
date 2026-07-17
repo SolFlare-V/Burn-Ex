@@ -9,12 +9,12 @@ Chains: feature_extractor -> classifier -> knee-visibility gate ->
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 
 from backend.ml.feature_extractor import extract_features
-from backend.ml.classifier import predict
+from backend.ml.classifier import predict, predict_proba
 from backend.ml.confirmation_window import ConfirmationWindow
 from backend.ml.unrecognised_timer import UnrecognisedTimer
 
@@ -56,6 +56,12 @@ class ClassificationResult:
     confirmed_type: str | None      # Confirmed exercise type, or None
     confidence: float               # Classifier confidence for the prediction
     unrecognised_warning: bool      # True once when unrecognised > 3 seconds
+    class_probabilities: dict[str, float] = field(default_factory=dict)
+    """Full probability distribution over exercise classes.
+    Empty dict when the knee-visibility gate fires or the model is not loaded.
+    Used by the calorie engine for confidence-weighted MET to reduce abrupt
+    MET jumps during borderline classifications.
+    """
 
 
 class MLPipeline:
@@ -89,6 +95,9 @@ class MLPipeline:
         # Stage 2: Classifier prediction
         raw_type, confidence = predict(features)
 
+        # Stage 2a: Full probability distribution (for confidence-weighted MET)
+        class_probabilities = predict_proba(features)
+
         # Stage 2b: Knee-visibility gate
         # If the classifier predicts a leg/floor exercise but neither knee
         # angle is present in the angle_map, suppress the prediction.
@@ -104,6 +113,10 @@ class MLPipeline:
         ):
             raw_type = None
             confidence = 0.0
+            # Gate fires: clear probabilities so the calorie engine falls
+            # through to standard single-class MET rather than using
+            # a distribution dominated by spurious knee-exercise classes.
+            class_probabilities = {}
 
         # Debug: log every 30 frames so server console shows classifier state
         # without flooding. Remove once detection is confirmed working.
@@ -129,6 +142,7 @@ class MLPipeline:
             confirmed_type=confirmed_type,
             confidence=confidence,
             unrecognised_warning=unrecognised_warning,
+            class_probabilities=class_probabilities,
         )
 
     def reset(self) -> None:
