@@ -33,6 +33,7 @@ from fastapi import WebSocket, WebSocketDisconnect
 from fastapi.routing import APIRouter
 
 from backend.calories.engine import CalorieEngine
+from backend.calories.intensity import IntensityEstimator
 from backend.cv.pipeline import process_frame
 from backend.ml.pipeline import MLPipeline
 from backend.reps.counter import RepCounter
@@ -73,6 +74,10 @@ class _SessionState:
         self.rep_counter = RepCounter()
         self.form_tracker = SetFormTracker()
         self.calorie_engine = CalorieEngine(weight_kg=weight_kg)
+        self.intensity_estimator = IntensityEstimator(fps=15.0)
+
+        # Current smoothed intensity multiplier (updated every frame)
+        self.intensity_multiplier: float = 1.0
 
         # Exercise-change tracking (TASK-10.3)
         self.last_confirmed_type: Optional[str] = None
@@ -314,7 +319,9 @@ async def _process_frame_message(
     # calorie segment so calories stop accumulating during the blackout.
     if processed.occluded and not processed.landmarks:
         if state.segment_open and state.calorie_engine._open_segment is not None:
-            state.calorie_engine.close_segment(current_ts)
+            state.calorie_engine.close_segment(
+                current_ts, intensity_multiplier=state.intensity_multiplier
+            )
             state.segment_open = False
             logger.debug("Calorie segment closed: no person in frame (session %s)", state.session_id)
 
@@ -343,22 +350,37 @@ async def _process_frame_message(
         ts = time.time()
         if state.segment_open:
             try:
-                state.calorie_engine.close_segment(ts)
+                state.calorie_engine.close_segment(
+                    ts, intensity_multiplier=state.intensity_multiplier
+                )
             except RuntimeError:
                 pass
             state.segment_open = False
         state.last_confirmed_type = None
 
-    # --- Stage 3: Form scoring ---
+    # --- Stage 3: Intensity estimation ---
+    # Run after classification so exercise_type is known.
+    # elapsed_seconds is used as dt for velocity calculations.
+    intensity_result = state.intensity_estimator.update(
+        landmarks=processed.landmarks or [],
+        angle_map=processed.angle_map,
+        exercise_type=confirmed_type,
+        elapsed_s=elapsed_seconds,
+    )
+    state.intensity_multiplier = intensity_result.multiplier
+
+    # --- Stage 4: Form scoring ---
     scoring = score_frame(processed, confirmed_type)
 
-    # --- Stage 4: Rep counting ---
+    # --- Stage 5: Rep counting ---
     rep_state = state.rep_counter.update_rep_state(
         processed.angle_map, confirmed_type, elapsed_seconds
     )
 
-    # --- Stage 5: Calorie running estimate ---
-    calories_running = state.calorie_engine.running_estimate(current_ts)
+    # --- Stage 6: Calorie running estimate ---
+    calories_running = state.calorie_engine.running_estimate(
+        current_ts, intensity_multiplier=state.intensity_multiplier
+    )
 
     # --- Update session manager state cache for persistence/interrupt ---
     session_manager.update_state_cache(
@@ -426,6 +448,9 @@ async def _process_frame_message(
         # Debug fields — visible in browser console
         "_confidence": round(classification.confidence, 3),
         "_angle_count": len(processed.angle_map),
+        # Intensity fields — dynamic calorie multiplier and component scores
+        "_intensity_multiplier": round(state.intensity_multiplier, 3),
+        "_intensity_is_resting": intensity_result.is_resting,
     }
 
 
@@ -444,8 +469,12 @@ def _handle_exercise_change(new_type: str, state: _SessionState) -> None:
     ts = time.time()
 
     if state.segment_open:
-        # Close current segment and open a new one
-        state.calorie_engine.change_exercise(new_type, ts)
+        # Close current segment (with accumulated intensity multiplier) and open new one
+        state.calorie_engine.change_exercise(
+            new_type, ts, intensity_multiplier=state.intensity_multiplier
+        )
+        # Reset intensity history when exercise changes
+        state.intensity_estimator.reset()
         logger.info(
             "Exercise change: %s → %s (session %s)",
             state.last_confirmed_type, new_type, state.session_id,

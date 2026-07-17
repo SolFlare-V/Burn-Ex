@@ -155,14 +155,20 @@ class CalorieEngine:
         )
         self._segments.append(seg)
 
-    def close_segment(self, timestamp: float) -> CalorieSegment:
+    def close_segment(
+        self,
+        timestamp: float,
+        intensity_multiplier: float = 1.0,
+    ) -> CalorieSegment:
         """
         Close the currently open segment, compute its calories, and return it.
 
-        calories = MET[exercise] × weight_kg × duration_hours
+        calories = MET[exercise] × weight_kg × duration_hours × intensity_multiplier
 
         Args:
-            timestamp: Time when the segment ends.
+            timestamp:           Time when the segment ends.
+            intensity_multiplier: Movement-intensity scaling factor from
+                                  IntensityEstimator (default 1.0 = standard MET).
 
         Returns:
             The closed ``CalorieSegment`` with ``calories`` and
@@ -179,7 +185,8 @@ class CalorieEngine:
         duration_hours = duration_s / 3600.0
 
         met = _load_met_values()[seg.exercise_type]
-        calories = met * seg.weight_kg * duration_hours
+        multiplier = max(0.1, float(intensity_multiplier))  # floor at 0.1
+        calories = met * seg.weight_kg * duration_hours * multiplier
 
         seg.end_time = timestamp
         seg.calories = calories
@@ -207,7 +214,11 @@ class CalorieEngine:
         """
         self._last_frame_ts = timestamp
 
-    def running_estimate(self, current_timestamp: float) -> float:
+    def running_estimate(
+        self,
+        current_timestamp: float,
+        intensity_multiplier: float = 1.0,
+    ) -> float:
         """
         Live calorie total: closed segments + provisional open segment.
 
@@ -217,7 +228,9 @@ class CalorieEngine:
         frozen so calories do not keep growing with wall-clock time.
 
         Args:
-            current_timestamp: Current time (same clock used for notify_frame).
+            current_timestamp:   Current time (same clock used for notify_frame).
+            intensity_multiplier: Movement-intensity scaling factor from
+                                  IntensityEstimator for the provisional estimate.
 
         Returns:
             Total estimated calories burned so far (float).
@@ -239,7 +252,8 @@ class CalorieEngine:
         elapsed_s = max(0.0, self._last_frame_ts - seg.start_time)
         elapsed_hours = elapsed_s / 3600.0
         met = _load_met_values()[seg.exercise_type]
-        provisional = met * seg.weight_kg * elapsed_hours
+        multiplier = max(0.1, float(intensity_multiplier))
+        provisional = met * seg.weight_kg * elapsed_hours * multiplier
 
         return closed_total + provisional
 
@@ -247,7 +261,12 @@ class CalorieEngine:
     # TASK-8.4 — Exercise change
     # ------------------------------------------------------------------
 
-    def change_exercise(self, new_exercise_type: str, timestamp: float) -> None:
+    def change_exercise(
+        self,
+        new_exercise_type: str,
+        timestamp: float,
+        intensity_multiplier: float = 1.0,
+    ) -> None:
         """
         Atomically close the current segment and open a new one.
 
@@ -255,8 +274,10 @@ class CalorieEngine:
         *new_exercise_type* (handles the session-start edge case gracefully).
 
         Args:
-            new_exercise_type: The exercise type to transition to.
-            timestamp:         Time of the exercise change event.
+            new_exercise_type:   The exercise type to transition to.
+            timestamp:           Time of the exercise change event.
+            intensity_multiplier: Movement-intensity scaling factor applied to
+                                  the closing segment's final calorie calculation.
 
         Raises:
             KeyError: If *new_exercise_type* is not in the MET config.
@@ -269,7 +290,7 @@ class CalorieEngine:
             )
 
         if self._open_segment is not None:
-            self.close_segment(timestamp)
+            self.close_segment(timestamp, intensity_multiplier=intensity_multiplier)
 
         self.start_segment(new_exercise_type, timestamp)
 
