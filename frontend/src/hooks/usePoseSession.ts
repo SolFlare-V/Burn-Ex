@@ -45,6 +45,9 @@ export interface ServerMessage {
   landmarks: Landmark[]
   latency_ms?: number
   type?: string
+  capture_ts_echo?: number
+  _confidence?: number
+  _angle_count?: number
 }
 
 const DEFAULT_STATE: PoseSessionState = {
@@ -71,6 +74,9 @@ export interface UsePoseSessionReturn {
   disconnect: () => void
   /** Encode and send a JPEG blob as a base64 frame message. */
   sendFrame: (jpegBlob: Blob) => void
+  /** Send a pre-encoded base64 JPEG string directly — no FileReader round-trip.
+   *  captureTs is performance.now() at frame capture time for lag measurement. */
+  sendFrameBase64: (base64: string, captureTs?: number) => void
   /** Expose the last raw server message for debugging. */
   lastMessage: ServerMessage | null
 }
@@ -109,7 +115,10 @@ export function usePoseSession(): UsePoseSessionReturn {
         setLastMessage(msg)
         setState(prev => ({
           ...prev,
-          exercise: msg.exercise ?? prev.exercise,
+          // Use explicit null check: if server sends null, clear the field.
+          // Do NOT fall back to prev.exercise on null — that keeps stale state
+          // from a previous workout visible after the person stops moving.
+          exercise: msg.exercise !== undefined ? msg.exercise : prev.exercise,
           repCount: msg.rep_count ?? prev.repCount,
           setNumber: msg.set_number ?? prev.setNumber,
           formScore: msg.form_score ?? prev.formScore,
@@ -119,15 +128,13 @@ export function usePoseSession(): UsePoseSessionReturn {
           landmarks: msg.landmarks ?? prev.landmarks,
         }))
 
-        // Log every update so the verify script can confirm state updates
-        console.log('[usePoseSession] state updated:', {
-          exercise: msg.exercise,
-          rep_count: msg.rep_count,
-          form_score: msg.form_score,
-          landmarks: msg.landmarks?.length ?? 0,
-          warning: msg.warning,
-          latency_ms: msg.latency_ms,
-        })
+        // Frame timing instrumentation — logs every frame to browser console.
+        // capture_ts is performance.now() at the moment the frame was drawn from
+        // the video element. receiveTs is now. Gap = total pipeline lag.
+        const receiveTs = performance.now()
+        const captureTs = (msg as any).capture_ts_echo
+        const pipelineGap = captureTs ? (receiveTs - captureTs).toFixed(0) : '?'
+        console.log('[TIMING] capture→receive gap:', pipelineGap, 'ms | backend_latency:', msg.latency_ms, 'ms | exercise:', msg.exercise, '| angles:', (msg as any)._angle_count, '| conf:', (msg as any)._confidence)
       } catch (err) {
         console.error('[usePoseSession] parse error:', err)
       }
@@ -152,15 +159,29 @@ export function usePoseSession(): UsePoseSessionReturn {
   }, [])
 
   const sendFrame = useCallback((jpegBlob: Blob) => {
+    // Kept for API compatibility — prefer sendFrameBase64 to avoid
+    // the async FileReader round-trip.
     const ws = wsRef.current
     if (!ws || ws.readyState !== WebSocket.OPEN) return
 
     const reader = new FileReader()
     reader.onloadend = () => {
+      if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return
       const base64 = (reader.result as string).split(',')[1]
-      ws.send(JSON.stringify({ frame: base64, exercise_hint: 'squat' }))
+      wsRef.current.send(JSON.stringify({ frame: base64 }))
     }
     reader.readAsDataURL(jpegBlob)
+  }, [])
+
+  // Synchronous path — caller has already encoded to base64 via
+  // canvas.toDataURL(). No FileReader, no async delay, no frame queue buildup.
+  // captureTs is performance.now() at the moment the frame was drawn from the
+  // video element — embedded in the message so the backend echoes it back and
+  // we can measure total capture→receive gap in the browser console.
+  const sendFrameBase64 = useCallback((base64: string, captureTs?: number) => {
+    const ws = wsRef.current
+    if (!ws || ws.readyState !== WebSocket.OPEN) return
+    ws.send(JSON.stringify({ frame: base64, capture_ts: captureTs ?? performance.now() }))
   }, [])
 
   // Cleanup on unmount
@@ -170,5 +191,5 @@ export function usePoseSession(): UsePoseSessionReturn {
     }
   }, [])
 
-  return { state, connect, disconnect, sendFrame, lastMessage }
+  return { state, connect, disconnect, sendFrame, sendFrameBase64, lastMessage }
 }

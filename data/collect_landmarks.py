@@ -212,12 +212,19 @@ def main() -> None:
             # Build overlay info
             status_color = (0, 200, 0) if not paused else (0, 140, 255)
             angles_found = len(result.angle_map)
+            # Plank bypasses motion filter — show "HOLD-write" instead of STILL-skip
+            is_plank_exercise = args.exercise == "plank"
+            motion_label = (
+                "HOLD-write" if is_plank_exercise and result.angle_map and not result.occluded
+                else "MOVING" if _is_moving(result.angle_map, last_angle_map)
+                else "STILL-skip"
+            )
             status_text = (
                 f"{'PAUSED' if paused else 'RECORDING'} | "
                 f"Exercise: {args.exercise} | "
                 f"Rows: {rows_written} | "
                 f"Angles: {angles_found}/10 | "
-                f"{'OCCLUDED' if result.occluded else 'MOVING' if _is_moving(result.angle_map, last_angle_map) else 'STILL-skip'}"
+                f"{'OCCLUDED' if result.occluded else motion_label}"
             )
 
             # Draw overlay on frame
@@ -241,12 +248,15 @@ def main() -> None:
 
             cv2.imshow(f"Burn-Ex Collector — {args.exercise}", display)
 
-            # Write row only if not paused, not occluded, has angles,
-            # AND joints are moving (angle change > threshold vs last frame).
+            # Write row if not paused, not occluded, has angles.
+            # For plank (static hold): skip the motion filter — write every frame,
+            # since plank by definition has no movement and the motion filter
+            # would discard almost all plank data, starving the classifier.
+            # For all other exercises: require angle change > threshold to avoid
+            # flooding the dataset with identical static-pose frames.
+            is_plank = args.exercise == "plank"
             if not paused and not result.occluded and result.angle_map:
-                # Motion check: at least one angle must have changed by > 3°
-                # vs the last written frame to avoid flooding with static poses.
-                if _is_moving(result.angle_map, last_angle_map):
+                if is_plank or _is_moving(result.angle_map, last_angle_map):
                     row = row_from_angle_map(args.exercise, result.angle_map)
                     writer.writerow(row)
                     f.flush()

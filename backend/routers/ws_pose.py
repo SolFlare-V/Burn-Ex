@@ -26,6 +26,7 @@ import base64
 import json
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
 from fastapi import WebSocket, WebSocketDisconnect
@@ -42,6 +43,11 @@ from backend.session.manager import session_manager
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+# Thread pool for CPU-heavy synchronous work (MediaPipe + ML inference).
+# Running these on the asyncio event loop thread blocked frame reception,
+# causing a backlog of stale frames that processed long after movement stopped.
+_cpu_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="cv_worker")
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -209,6 +215,29 @@ async def ws_pose(websocket: WebSocket):
             elapsed = now - state.last_frame_ts
             state.last_frame_ts = now
 
+            # Drop stale frames: if the previous frame took >150ms to process,
+            # the client may have queued several more. Drain them without
+            # processing so we only act on the most current frame.
+            if elapsed > 0.15:
+                try:
+                    # Non-blocking drain of any buffered messages
+                    while True:
+                        drained = await asyncio.wait_for(
+                            websocket.receive_text(), timeout=0.001
+                        )
+                        try:
+                            dm = json.loads(drained)
+                            if isinstance(dm, dict) and dm.get("type") == "pong":
+                                continue  # keep pong handling
+                        except Exception:
+                            pass
+                        raw = drained  # use the most recent frame
+                        now = time.monotonic()
+                        elapsed = now - state.last_frame_ts
+                        state.last_frame_ts = now
+                except asyncio.TimeoutError:
+                    pass  # nothing more buffered
+
             response = await _process_frame_message(raw, elapsed, state)
             await websocket.send_text(json.dumps(response))
 
@@ -247,13 +276,14 @@ async def _process_frame_message(
         msg = json.loads(raw)
         if isinstance(msg, dict):
             b64 = msg.get("frame", "")
-            exercise_hint = msg.get("exercise_hint", "squat")
+            # Echo capture timestamp back to client for round-trip lag measurement
+            capture_ts_echo = msg.get("capture_ts")
         else:
             b64 = str(msg)
-            exercise_hint = "squat"
+            capture_ts_echo = None
     except (json.JSONDecodeError, TypeError):
         b64 = raw.strip()
-        exercise_hint = "squat"
+        capture_ts_echo = None
 
     # Decode base64 JPEG
     try:
@@ -263,13 +293,37 @@ async def _process_frame_message(
 
     t_start = time.monotonic()
 
-    # --- Stage 1: CV pipeline ---
-    exercise_for_cv = state.last_confirmed_type or exercise_hint
-    processed = process_frame(jpeg_bytes, exercise_for_cv)
+    # --- Stage 1: CV pipeline (run in thread pool so event loop stays free) ---
+    # Previously this ran synchronously on the event loop thread, blocking
+    # frame reception for ~80-120ms per frame. Frames queued in the OS socket
+    # buffer and processed long after the user stopped moving.
+    loop = asyncio.get_event_loop()
+    exercise_for_cv = state.last_confirmed_type
+    processed = await loop.run_in_executor(
+        _cpu_executor,
+        process_frame,
+        jpeg_bytes,
+        exercise_for_cv,
+    )
 
-    # --- Stage 2: ML classification ---
-    classification = state.ml_pipeline.classify_frame(
-        processed.angle_map, elapsed_seconds
+    # Notify calorie engine that a real frame arrived (gates idle detection).
+    current_ts = time.time()
+    state.calorie_engine.notify_frame(current_ts)
+
+    # If no person is detected (screen black, camera covered) close any open
+    # calorie segment so calories stop accumulating during the blackout.
+    if processed.occluded and not processed.landmarks:
+        if state.segment_open and state.calorie_engine._open_segment is not None:
+            state.calorie_engine.close_segment(current_ts)
+            state.segment_open = False
+            logger.debug("Calorie segment closed: no person in frame (session %s)", state.session_id)
+
+    # --- Stage 2: ML classification (also in thread pool) ---
+    classification = await loop.run_in_executor(
+        _cpu_executor,
+        state.ml_pipeline.classify_frame,
+        processed.angle_map,
+        elapsed_seconds,
     )
     confirmed_type = classification.confirmed_type
 
@@ -280,6 +334,21 @@ async def _process_frame_message(
     ):
         _handle_exercise_change(confirmed_type, state)
 
+    # --- Drop-out handling: classification returned None after being confirmed ---
+    # When the camera blacks out or the person leaves frame, the confirmation
+    # window will return None. Close the open calorie segment so calories stop
+    # accumulating, and clear last_confirmed_type so we don't keep using a
+    # stale exercise label.
+    elif confirmed_type is None and state.last_confirmed_type is not None:
+        ts = time.time()
+        if state.segment_open:
+            try:
+                state.calorie_engine.close_segment(ts)
+            except RuntimeError:
+                pass
+            state.segment_open = False
+        state.last_confirmed_type = None
+
     # --- Stage 3: Form scoring ---
     scoring = score_frame(processed, confirmed_type)
 
@@ -289,7 +358,6 @@ async def _process_frame_message(
     )
 
     # --- Stage 5: Calorie running estimate ---
-    current_ts = time.time()
     calories_running = state.calorie_engine.running_estimate(current_ts)
 
     # --- Update session manager state cache for persistence/interrupt ---
@@ -305,10 +373,29 @@ async def _process_frame_message(
     latency_ms = (t_end - t_start) * 1000.0
 
     # --- TASK-10.4: Warning injection ---
-    # Occlusion warning overrides unrecognised warning
+    # Priority: no-body > occluded > step-back > unrecognised
     warning = ""
-    if processed.occluded:
+
+    # Detect face-only framing: landmarks present but none of the key
+    # exercise landmarks (shoulders=11,12, hips=23,24) are visible.
+    # This means the camera is too close / pointed at face only.
+    # Use a lower visibility threshold (0.3) for shoulder presence check
+    # since MediaPipe often returns shoulders at low confidence in close-up views.
+    landmark_ids_any = {lm.id for lm in (processed.landmarks or []) if lm.visibility >= 0.3}
+    landmark_ids_confident = {lm.id for lm in (processed.landmarks or []) if lm.visibility >= 0.5}
+    has_shoulders = bool(landmark_ids_confident & {11, 12})
+    has_hips = bool(landmark_ids_confident & {23, 24})
+    has_elbows = bool(landmark_ids_confident & {13, 14})
+
+    # No useful body landmarks at all — face close-up
+    body_landmark_count = len(landmark_ids_confident & set(range(11, 33)))
+
+    if processed.landmarks and body_landmark_count < 4:
+        warning = "Step back — point camera at your full body"
+    elif processed.occluded:
         warning = "Move into frame"
+    elif has_shoulders and not has_elbows and confirmed_type is None:
+        warning = "Move back so your arms are fully visible"
     elif classification.unrecognised_warning:
         warning = "Exercise not recognized — adjust position"
 
@@ -334,6 +421,11 @@ async def _process_frame_message(
         "warning": warning,
         "landmarks": landmarks_out,
         "latency_ms": round(latency_ms, 1),
+        # Timing instrumentation — echoed to client for capture→receive gap calc
+        "capture_ts_echo": capture_ts_echo,
+        # Debug fields — visible in browser console
+        "_confidence": round(classification.confidence, 3),
+        "_angle_count": len(processed.angle_map),
     }
 
 

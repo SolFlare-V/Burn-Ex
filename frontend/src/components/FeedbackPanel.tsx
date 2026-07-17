@@ -177,19 +177,17 @@ export const FormScoreGauge: React.FC<FormScoreGaugeProps> = ({ formScore }) => 
 // Subcomponent 5: CorrectionCues
 // ---------------------------------------------------------------------------
 interface CorrectionCuesProps {
-  corrections: string[] // List of active correction alerts (max 2 items)
-  warning: string | null // Active system warning ("Move into frame", "Exercise not recognized...", etc.)
+  exercise: string | null
+  corrections: string[]
+  warning: string | null
 }
 
-export const CorrectionCues: React.FC<CorrectionCuesProps> = ({ corrections, warning }) => {
+export const CorrectionCues: React.FC<CorrectionCuesProps> = ({ exercise, corrections, warning }) => {
   const visibleCues = corrections.slice(0, 2)
 
-  // Only show the positive "form looks solid" message when:
-  //   - corrections is empty (no form violations), AND
-  //   - warning is null/empty (not occluded / not unrecognised)
-  // When a warning is active the sensor data is unreliable — showing
-  // "Form looks solid" would be a false positive.
-  const showPositive = visibleCues.length === 0 && !warning
+  // Show "Form looks solid" only when exercise is confirmed, corrections empty, no warning.
+  // Before exercise confirmation, show a neutral waiting state — not a false positive.
+  const showPositive = !!exercise && visibleCues.length === 0 && !warning
 
   return (
     <div className="flex flex-col p-4 bg-slate-900/30 border border-slate-800/40 rounded-xl backdrop-blur-md col-span-1 sm:col-span-2">
@@ -280,7 +278,7 @@ export const FeedbackPanel: React.FC<FeedbackPanelProps> = ({
         <RepCounter repCount={repCount} setNumber={setNumber} />
         <CalorieDisplay caloriesRunning={caloriesRunning} />
         <FormScoreGauge formScore={formScore} />
-        <CorrectionCues corrections={corrections} warning={warning} />
+        <CorrectionCues exercise={exercise} corrections={corrections} warning={warning} />
       </div>
     </div>
   )

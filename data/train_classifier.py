@@ -105,11 +105,11 @@ def train(X: np.ndarray, y: np.ndarray, classes: list[str]) -> RandomForestClass
     print(f"  Train: {len(X_train)} samples | Test: {len(X_test)} samples")
 
     clf = RandomForestClassifier(
-        n_estimators=200,
+        n_estimators=300,
         max_depth=None,
         min_samples_split=4,
         min_samples_leaf=2,
-        class_weight="balanced",
+        class_weight="balanced",  # sklearn balances by inverse class frequency
         random_state=42,
         n_jobs=-1,
     )

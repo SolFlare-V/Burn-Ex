@@ -8,6 +8,7 @@ Design ref: §3.1, §3.3. REQs: REQ-9.1–REQ-9.5.
 
 Error codes:
   422 INVALID_WEIGHT       — weight_kg outside 20–300 range
+  422 INVALID_HEIGHT       — height_cm outside 50–300 range
   409 WEIGHT_LOCKED_DURING_SESSION — weight update attempted while session active
 """
 from __future__ import annotations
@@ -24,6 +25,9 @@ from backend.session.manager import session_manager
 
 router = APIRouter(prefix="/api/v1/user", tags=["user"])
 
+FITNESS_GOALS = {
+    "lose_weight", "build_muscle", "get_toned", "stay_fit", "improve_endurance"
+}
 
 # ---------------------------------------------------------------------------
 # Schemas
@@ -33,6 +37,8 @@ class UserProfile(BaseModel):
     id: int
     name: Optional[str] = None
     weight_kg: float
+    height_cm: Optional[float] = None
+    fitness_goal: Optional[str] = None
     created_at: datetime
 
 
@@ -40,12 +46,30 @@ class UserUpdate(BaseModel):
     user_id: int
     name: Optional[str] = None
     weight_kg: Optional[float] = None
+    height_cm: Optional[float] = None
+    fitness_goal: Optional[str] = None
 
 
 class UserCreate(BaseModel):
     name: Optional[str] = None
     weight_kg: float
+    height_cm: Optional[float] = None
+    fitness_goal: Optional[str] = None
 
+
+# ---------------------------------------------------------------------------
+# Helper
+# ---------------------------------------------------------------------------
+
+def _row_to_profile(row: User) -> UserProfile:
+    return UserProfile(
+        id=row.id,
+        name=row.name,
+        weight_kg=row.weight_kg,
+        height_cm=row.height_cm,
+        fitness_goal=row.fitness_goal,
+        created_at=row.created_at,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -59,12 +83,7 @@ def get_user(user_id: int):
         row = db.query(User).filter(User.id == user_id).first()
         if row is None:
             raise HTTPException(status_code=404, detail="User not found")
-        return UserProfile(
-            id=row.id,
-            name=row.name,
-            weight_kg=row.weight_kg,
-            created_at=row.created_at,
-        )
+        return _row_to_profile(row)
     finally:
         db.close()
 
@@ -75,14 +94,20 @@ def get_user(user_id: int):
 
 @router.post("", response_model=UserProfile)
 def create_user(body: UserCreate):
-    # Validate weight range before any DB work
     if body.weight_kg < 20 or body.weight_kg > 300:
         raise HTTPException(
             status_code=422,
-            detail={
-                "code": "INVALID_WEIGHT",
-                "message": f"weight_kg must be between 20 and 300, got {body.weight_kg}",
-            },
+            detail={"code": "INVALID_WEIGHT", "message": f"weight_kg must be 20–300, got {body.weight_kg}"},
+        )
+    if body.height_cm is not None and (body.height_cm < 50 or body.height_cm > 300):
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "INVALID_HEIGHT", "message": f"height_cm must be 50–300, got {body.height_cm}"},
+        )
+    if body.fitness_goal is not None and body.fitness_goal not in FITNESS_GOALS:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "INVALID_GOAL", "message": f"fitness_goal must be one of {sorted(FITNESS_GOALS)}"},
         )
 
     db = SessionLocal()
@@ -90,19 +115,15 @@ def create_user(body: UserCreate):
         row = User(
             name=body.name,
             weight_kg=body.weight_kg,
+            height_cm=body.height_cm,
+            fitness_goal=body.fitness_goal,
         )
         db.add(row)
         db.commit()
         db.refresh(row)
-        return UserProfile(
-            id=row.id,
-            name=row.name,
-            weight_kg=row.weight_kg,
-            created_at=row.created_at,
-        )
+        return _row_to_profile(row)
     finally:
         db.close()
-
 
 
 # ---------------------------------------------------------------------------
@@ -111,25 +132,27 @@ def create_user(body: UserCreate):
 
 @router.put("", response_model=UserProfile)
 def update_user(body: UserUpdate):
-    # Validate weight range before any DB work
     if body.weight_kg is not None:
         if body.weight_kg < 20 or body.weight_kg > 300:
             raise HTTPException(
                 status_code=422,
-                detail={
-                    "code": "INVALID_WEIGHT",
-                    "message": f"weight_kg must be between 20 and 300, got {body.weight_kg}",
-                },
+                detail={"code": "INVALID_WEIGHT", "message": f"weight_kg must be 20–300, got {body.weight_kg}"},
             )
-        # Block weight change during active session
         if session_manager.active_session_id is not None:
             raise HTTPException(
                 status_code=409,
-                detail={
-                    "code": "WEIGHT_LOCKED_DURING_SESSION",
-                    "message": "Cannot update weight while a session is active",
-                },
+                detail={"code": "WEIGHT_LOCKED_DURING_SESSION", "message": "Cannot update weight while a session is active"},
             )
+    if body.height_cm is not None and (body.height_cm < 50 or body.height_cm > 300):
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "INVALID_HEIGHT", "message": f"height_cm must be 50–300, got {body.height_cm}"},
+        )
+    if body.fitness_goal is not None and body.fitness_goal not in FITNESS_GOALS:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "INVALID_GOAL", "message": f"fitness_goal must be one of {sorted(FITNESS_GOALS)}"},
+        )
 
     db = SessionLocal()
     try:
@@ -141,14 +164,13 @@ def update_user(body: UserUpdate):
             row.name = body.name
         if body.weight_kg is not None:
             row.weight_kg = body.weight_kg
+        if body.height_cm is not None:
+            row.height_cm = body.height_cm
+        if body.fitness_goal is not None:
+            row.fitness_goal = body.fitness_goal
 
         db.commit()
         db.refresh(row)
-        return UserProfile(
-            id=row.id,
-            name=row.name,
-            weight_kg=row.weight_kg,
-            created_at=row.created_at,
-        )
+        return _row_to_profile(row)
     finally:
         db.close()

@@ -112,6 +112,8 @@ export interface UserProfile {
   id: number
   name: string | null
   weight_kg: number
+  height_cm: number | null
+  fitness_goal: string | null
   created_at: string
 }
 

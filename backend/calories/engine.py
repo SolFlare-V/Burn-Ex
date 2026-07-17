@@ -103,6 +103,13 @@ class CalorieEngine:
         ValueError: If ``weight_kg <= 0``.
     """
 
+    # Seconds of silence after which calorie accumulation is paused.
+    # If no frame arrives within this window the open segment is treated
+    # as paused — running_estimate returns only the closed total until
+    # frames resume. This prevents calories accumulating when the camera
+    # is covered, the tab is hidden, or the user walks away mid-session.
+    IDLE_PAUSE_THRESHOLD: float = 5.0
+
     def __init__(self, weight_kg: float) -> None:
         if weight_kg <= 0:
             raise ValueError(
@@ -110,6 +117,8 @@ class CalorieEngine:
             )
         self._weight_kg: float = weight_kg
         self._segments: list[CalorieSegment] = []
+        # Timestamp of the most recent frame received; updated by notify_frame().
+        self._last_frame_ts: Optional[float] = None
 
     # ------------------------------------------------------------------
     # TASK-8.2 — Segment lifecycle
@@ -190,13 +199,25 @@ class CalorieEngine:
     # TASK-8.3 — Running estimate (includes open segment)
     # ------------------------------------------------------------------
 
+    def notify_frame(self, timestamp: float) -> None:
+        """
+        Record the timestamp of the most recently received frame.
+        Must be called each frame before running_estimate() so the
+        idle-detection gate works correctly.
+        """
+        self._last_frame_ts = timestamp
+
     def running_estimate(self, current_timestamp: float) -> float:
         """
         Live calorie total: closed segments + provisional open segment.
 
+        Calories only accumulate up to the last received frame timestamp.
+        If no frame has arrived within IDLE_PAUSE_THRESHOLD seconds (screen
+        black, camera covered, tab hidden), the open-segment contribution is
+        frozen so calories do not keep growing with wall-clock time.
+
         Args:
-            current_timestamp: Current time used to estimate the open
-                               segment's elapsed duration.
+            current_timestamp: Current time (same clock used for notify_frame).
 
         Returns:
             Total estimated calories burned so far (float).
@@ -207,7 +228,15 @@ class CalorieEngine:
         if seg is None:
             return closed_total
 
-        elapsed_s = max(0.0, current_timestamp - seg.start_time)
+        # No frames ever received, or no frame recently — freeze accumulation.
+        if self._last_frame_ts is None:
+            return closed_total
+        idle_s = current_timestamp - self._last_frame_ts
+        if idle_s > self.IDLE_PAUSE_THRESHOLD:
+            return closed_total
+
+        # Accumulate only up to the last real frame, not wall clock.
+        elapsed_s = max(0.0, self._last_frame_ts - seg.start_time)
         elapsed_hours = elapsed_s / 3600.0
         met = _load_met_values()[seg.exercise_type]
         provisional = met * seg.weight_kg * elapsed_hours

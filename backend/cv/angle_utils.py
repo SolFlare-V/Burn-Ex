@@ -70,6 +70,22 @@ _ANGLE_TRIPLETS: dict[str, dict[str, tuple[int, int, int]]] = {
     },
 }
 
+# Universal angle set used when exercise type is not yet confirmed.
+# Covers all 10 features the classifier expects so it always gets real
+# angle data regardless of which exercise the user is doing.
+_UNIVERSAL_TRIPLETS: dict[str, tuple[int, int, int]] = {
+    "left_knee":      (23, 25, 27),
+    "right_knee":     (24, 26, 28),
+    "left_hip":       (11, 23, 25),
+    "right_hip":      (12, 24, 26),
+    "left_elbow":     (11, 13, 15),
+    "right_elbow":    (12, 14, 16),
+    "left_shoulder":  (13, 11, 23),
+    "right_shoulder": (14, 12, 24),
+    "trunk":          (23, 11, 12),
+    "left_ankle":     (25, 27, 31),
+}
+
 _LandmarkLike = Union[Landmark, FilteredLandmark]
 
 
@@ -102,20 +118,30 @@ def calculate_angle(
 
 def calculate_angle_map(
     landmark_set: list[_LandmarkLike],
-    exercise_type: str,
+    exercise_type: str | None,
 ) -> dict[str, float]:
     """
     Compute all relevant joint angles for the given exercise.
 
+    When exercise_type is None (not yet confirmed), the universal triplet set
+    is used so the classifier always receives real angle data and can bootstrap
+    detection. Without this, exercise_type=None produced an empty angle_map,
+    causing the feature extractor to impute all features with training medians
+    — the classifier saw the same neutral vector every frame and never confirmed.
+
     Args:
         landmark_set:  List of 33 Landmark or FilteredLandmark objects.
-        exercise_type: Exercise name key (e.g. "squat").
+        exercise_type: Exercise name key (e.g. "squat"), or None.
 
     Returns:
         Dict mapping angle name -> degrees. Angles whose required landmarks
-        are missing or have id out of range are omitted from the result.
+        are missing or low-confidence are omitted from the result.
     """
-    triplets = _ANGLE_TRIPLETS.get(exercise_type, {})
+    if exercise_type is None:
+        triplets = _UNIVERSAL_TRIPLETS
+    else:
+        triplets = _ANGLE_TRIPLETS.get(exercise_type, {})
+
     if not triplets:
         return {}
 
@@ -129,14 +155,29 @@ def calculate_angle_map(
         lm_b = lm_map.get(id_b)
 
         if lm_a is None or lm_v is None or lm_b is None:
+            # Elbow-angle fallback: if wrist (15 or 16) is missing/occluded,
+            # approximate using shoulder→elbow vector angle vs vertical.
+            # This allows bicep curl rep counting even when wrists are off-camera.
+            if angle_name in ("left_elbow", "right_elbow") and lm_a is not None and lm_v is not None:
+                approx = _elbow_angle_from_upper_arm(lm_a, lm_v)
+                if approx is not None:
+                    angle_map[angle_name] = approx
             continue
 
         # Skip if any of the three is invalid (FilteredLandmark)
         if hasattr(lm_a, "valid") and not lm_a.valid:
+            if angle_name in ("left_elbow", "right_elbow"):
+                approx = _elbow_angle_from_upper_arm(lm_a, lm_v)
+                if approx is not None:
+                    angle_map[angle_name] = approx
             continue
         if hasattr(lm_v, "valid") and not lm_v.valid:
             continue
         if hasattr(lm_b, "valid") and not lm_b.valid:
+            if angle_name in ("left_elbow", "right_elbow"):
+                approx = _elbow_angle_from_upper_arm(lm_a, lm_v)
+                if approx is not None:
+                    angle_map[angle_name] = approx
             continue
 
         angle = calculate_angle(
@@ -147,3 +188,38 @@ def calculate_angle_map(
         angle_map[angle_name] = angle
 
     return angle_map
+
+
+def _elbow_angle_from_upper_arm(
+    shoulder: _LandmarkLike,
+    elbow: _LandmarkLike,
+) -> float | None:
+    """
+    Approximate elbow flexion angle from the upper-arm vector angle vs vertical.
+
+    Used as a fallback when the wrist landmark is off-camera. Maps the
+    shoulder→elbow direction to an estimated elbow angle in [30, 170] degrees:
+    - arm hanging straight down → ~170° (extended)
+    - arm raised horizontal     → ~90°
+    - arm curled up              → ~40°
+
+    This is not geometrically equivalent to the true elbow angle but gives the
+    rep state machine enough signal to track bicep curl cycles.
+    """
+    dx = elbow.x - shoulder.x
+    dy = elbow.y - shoulder.y  # positive = downward in normalized coords
+
+    mag = math.sqrt(dx * dx + dy * dy)
+    if mag < 1e-6:
+        return None
+
+    # Angle of upper-arm vector from straight-down vertical (positive Y axis)
+    # atan2(dx, dy): 0° = pointing down, 90° = horizontal, 180° = pointing up
+    arm_angle_rad = math.atan2(abs(dx), dy)
+    arm_angle_deg = math.degrees(arm_angle_rad)
+
+    # Map arm_angle_deg [0°..180°] to approximate elbow angle [170°..30°]:
+    # straight down (0°) → fully extended elbow (~170°)
+    # pointing up (180°) → fully curled (~30°)
+    approx_elbow = 170.0 - (arm_angle_deg / 180.0) * 140.0
+    return max(20.0, min(175.0, approx_elbow))

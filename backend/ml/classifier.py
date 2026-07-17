@@ -7,10 +7,20 @@ Exposes predict(feature_vector) -> (exercise_type | None, confidence).
 
 from __future__ import annotations
 
+import logging
 import os
 
 import joblib
 import numpy as np
+
+# ---------------------------------------------------------------------------
+# Feature vector diagnostic logging.
+# Enable with:  BURN_EX_LOG_FEATURES=1  in the environment before starting
+# the backend server.  Logs every prediction to the standard logger so the
+# output appears in the server console / terminal window.
+# ---------------------------------------------------------------------------
+_FEATURE_LOG_ENABLED = os.environ.get("BURN_EX_LOG_FEATURES", "0") == "1"
+_feature_logger = logging.getLogger("burn_ex.classifier")
 
 # ---------------------------------------------------------------------------
 # Resolve model path
@@ -19,7 +29,9 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(_HERE))
 _MODEL_PATH = os.path.join(_PROJECT_ROOT, "models", "exercise_classifier.pkl")
 
-CONFIDENCE_THRESHOLD = 0.6
+CONFIDENCE_THRESHOLD = 0.35  # Low enough for partial-body frames where probability
+# is spread across similar-looking exercises (e.g. bicep_curl vs shoulder_press).
+# At 6 classes random baseline = 0.17; 0.35 is still well above noise.
 
 
 def _load_model():
@@ -38,6 +50,13 @@ try:
 except FileNotFoundError:
     _clf = None
     _MODEL_LOADED = False
+
+
+_FEATURE_NAMES = [
+    "left_knee", "right_knee", "left_hip", "right_hip",
+    "left_elbow", "right_elbow", "left_shoulder", "right_shoulder",
+    "trunk", "left_ankle",
+]
 
 
 def predict(
@@ -67,6 +86,24 @@ def predict(
     max_idx = int(np.argmax(proba))
     max_prob = float(proba[max_idx])
     class_name: str = _clf.classes_[max_idx]
+
+    # ------------------------------------------------------------------
+    # Diagnostic feature-vector logging (BURN_EX_LOG_FEATURES=1)
+    # Prints the raw angles and per-class probabilities for every frame
+    # so you can confirm what values the model is actually receiving.
+    # ------------------------------------------------------------------
+    if _FEATURE_LOG_ENABLED:
+        angles_str = "  ".join(
+            f"{name}={vec[0, i]:.1f}" for i, name in enumerate(_FEATURE_NAMES)
+        )
+        probs_str = "  ".join(
+            f"{cls}={proba[j]:.3f}" for j, cls in enumerate(_clf.classes_)
+        )
+        verdict = class_name if max_prob >= CONFIDENCE_THRESHOLD else "BELOW_THRESHOLD"
+        _feature_logger.info(
+            "[FEATURE] %s | [PROBA] %s | [VERDICT] %s (%.3f)",
+            angles_str, probs_str, verdict, max_prob,
+        )
 
     if max_prob < CONFIDENCE_THRESHOLD:
         return (None, max_prob)

@@ -3,7 +3,8 @@ TASK-5.5 — ML classification pipeline.
 
 classify_frame(angle_map) -> ClassificationResult
 
-Chains: feature_extractor -> classifier -> confirmation_window -> unrecognised_timer
+Chains: feature_extractor -> classifier -> knee-visibility gate ->
+        confirmation_window -> unrecognised_timer
 """
 
 from __future__ import annotations
@@ -16,6 +17,37 @@ from backend.ml.feature_extractor import extract_features
 from backend.ml.classifier import predict
 from backend.ml.confirmation_window import ConfirmationWindow
 from backend.ml.unrecognised_timer import UnrecognisedTimer
+
+# ---------------------------------------------------------------------------
+# Knee-visibility gate
+#
+# Exercises that require knee landmarks to be meaningfully distinguished
+# from floor-based exercises (plank, push_up). When the classifier predicts
+# one of these classes but BOTH knee angles are absent from the angle_map,
+# the prediction is suppressed (treated as None).
+#
+# Why targeted rather than universal:
+#   - shoulder_press and bicep_curl legitimately don't involve knees.
+#     Their triplet sets don't compute knee angles, so knees will always
+#     be absent when those exercises are being performed.  A universal gate
+#     would permanently block them.
+#   - plank, squat, lunge, push_up all require knee evidence to be
+#     distinguished from each other. Without real knee angles the model
+#     relies on imputed medians (164.9 / 152.9) which fall squarely in
+#     the plank training distribution, causing the plank feedback loop.
+#
+# The gate fires when:
+#   1. The classifier predicts a class in _KNEE_REQUIRED_CLASSES, AND
+#   2. Neither "left_knee" nor "right_knee" appears in the angle_map
+#      (meaning MediaPipe did not produce a confident reading for either
+#       knee landmark, visibility < 0.5 in confidence_filter.py).
+# ---------------------------------------------------------------------------
+_KNEE_REQUIRED_CLASSES: frozenset[str] = frozenset({
+    "plank",
+    "squat",
+    "lunge",
+    "push_up",
+})
 
 
 @dataclass
@@ -56,6 +88,34 @@ class MLPipeline:
 
         # Stage 2: Classifier prediction
         raw_type, confidence = predict(features)
+
+        # Stage 2b: Knee-visibility gate
+        # If the classifier predicts a leg/floor exercise but neither knee
+        # angle is present in the angle_map, suppress the prediction.
+        # This prevents the plank feedback loop: once plank is confirmed the
+        # plank triplet set stops computing knees, imputed median knee values
+        # look like plank training data, and plank fires forever regardless
+        # of what the user is actually doing.
+        # shoulder_press and bicep_curl are exempt — they never use knees.
+        if (
+            raw_type in _KNEE_REQUIRED_CLASSES
+            and "left_knee" not in (angle_map or {})
+            and "right_knee" not in (angle_map or {})
+        ):
+            raw_type = None
+            confidence = 0.0
+
+        # Debug: log every 30 frames so server console shows classifier state
+        # without flooding. Remove once detection is confirmed working.
+        self._debug_frame_count = getattr(self, '_debug_frame_count', 0) + 1
+        if self._debug_frame_count % 30 == 0:
+            import logging
+            _log = logging.getLogger(__name__)
+            _log.info(
+                "[ML] raw=%s conf=%.2f angles=%s",
+                raw_type, confidence,
+                {k: round(v, 1) for k, v in (angle_map or {}).items()},
+            )
 
         # Stage 3: Confirmation window
         confirmed_type = self._confirmation_window.update(raw_type)

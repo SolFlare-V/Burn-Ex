@@ -53,10 +53,44 @@ export function useSessionLifecycle(): SessionLifecycle {
 
       if (!res.ok) {
         const body = await res.json().catch(() => ({}))
-        const code = body?.detail?.code ?? res.status
-        if (res.status === 409) {
-          setError('SESSION_ALREADY_ACTIVE')
-        } else if (res.status === 422) {
+        const detail = body?.detail ?? {}
+        const code = typeof detail === 'object' ? detail.code : detail
+
+        if (res.status === 409 && code === 'SESSION_ALREADY_ACTIVE') {
+          // A stale session is blocking start (usually from a server restart).
+          // Find it in the session list and end it, then retry once.
+          const listRes = await fetch(`${API_BASE}/api/v1/sessions?limit=1`)
+          if (listRes.ok) {
+            const sessions = await listRes.json().catch(() => [])
+            const stale = sessions.find(
+              (s: { status: string; session_id: string }) => s.status === 'active'
+            )
+            if (stale) {
+              await fetch(`${API_BASE}/api/v1/sessions/${stale.session_id}/end`, {
+                method: 'POST',
+              }).catch(() => null)
+            }
+          }
+          // Retry start once after clearing the stale session.
+          const retryRes = await fetch(`${API_BASE}/api/v1/sessions/start`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ user_id: userId }),
+          })
+          if (!retryRes.ok) {
+            const retryBody = await retryRes.json().catch(() => ({}))
+            setError(`Failed to start session: ${retryBody?.detail?.code ?? retryRes.status}`)
+            return
+          }
+          const retryData = await retryRes.json()
+          const newSessionId: string = retryData.session_id
+          setSessionId(newSessionId)
+          setStatus('active')
+          poseSession.connect(newSessionId)
+          return
+        }
+
+        if (res.status === 422) {
           setError('WEIGHT_REQUIRED')
         } else {
           setError(`Start failed: ${code}`)

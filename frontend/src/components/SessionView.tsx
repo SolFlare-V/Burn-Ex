@@ -136,30 +136,25 @@ export const SessionView: React.FC = () => {
     const captureLoop = (timestamp: number) => {
       const video = videoRef.current
       if (video && video.readyState >= 2 && ctx) {
-        // Control frame rate to ~15 FPS (66.7ms interval)
+        // Throttle to ~15 FPS
         const delta = timestamp - lastFrameTimeRef.current
         if (delta >= 1000 / 15) {
           lastFrameTimeRef.current = timestamp
 
-          // Match canvas dimensions to the actual streaming video size
           canvas.width = video.videoWidth || 640
           canvas.height = video.videoHeight || 480
-
-          // Render the video frame to canvas
           ctx.drawImage(video, 0, 0, canvas.width, canvas.height)
 
-          canvas.toBlob(
-            blob => {
-              if (blob) {
-                poseSession.sendFrame(blob)
-              }
-            },
-            'image/jpeg',
-            0.8 // quality parameter matching latency retest standard
-          )
+          const dataUrl = canvas.toDataURL('image/jpeg', 0.6)
+          const base64 = dataUrl.split(',')[1]
+          if (base64) {
+            // Embed capture timestamp in the frame message so backend can
+            // report the capture→process gap in its response.
+            const captureTs = performance.now()
+            poseSession.sendFrameBase64(base64, captureTs)
+          }
         }
       }
-
       animationFrameIdRef.current = requestAnimationFrame(captureLoop)
     }
 
@@ -328,7 +323,7 @@ export const SessionView: React.FC = () => {
             <div className="flex flex-col gap-4">
               <FeedbackPanel
                 exercise={poseState.exercise}
-                confidence={poseSession.lastMessage?.latency_ms ? 0.95 : 0.0} // Fallback or mock confidence
+                confidence={poseSession.lastMessage?._confidence ?? 0}
                 repCount={poseState.repCount}
                 setNumber={poseState.setNumber}
                 caloriesRunning={poseState.caloriesRunning}

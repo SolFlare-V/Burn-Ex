@@ -48,6 +48,11 @@ class SessionManager:
     Maintains a global ``active_session_id`` to enforce the single-session
     constraint (REQ-6.5).  All state is stored in SQLite so it survives
     process restarts after interruptions.
+
+    On construction, the DB is queried for any session left in "active"
+    status from a previous run (e.g. server crash / hot-reload). Those
+    orphaned sessions are marked "interrupted" so the in-memory guard
+    and the DB are always consistent.
     """
 
     def __init__(self) -> None:
@@ -59,6 +64,37 @@ class SessionManager:
         self._rep_state = None
         self._calorie_engine = None
         self._form_tracker = None
+
+        # Recover state from DB on startup — marks any orphaned "active"
+        # sessions as "interrupted" so the guard is consistent with the DB.
+        self._recover_from_db()
+
+    def _recover_from_db(self) -> None:
+        """
+        On startup, interrupt any session left as 'active' in the DB.
+
+        This handles server restarts and hot-reloads where _active_session_id
+        was lost from memory but the DB row was never updated.
+        """
+        try:
+            db: DBSession = SessionLocal()
+            try:
+                from datetime import datetime, timezone
+                active_rows = (
+                    db.query(Session)
+                    .filter(Session.status == "active")
+                    .all()
+                )
+                for row in active_rows:
+                    row.status = "interrupted"
+                    row.ended_at = datetime.now(timezone.utc)
+                if active_rows:
+                    db.commit()
+            finally:
+                db.close()
+        except Exception:
+            # DB may not exist yet on very first run — silently skip.
+            pass
 
     # ------------------------------------------------------------------
     # TASK-9.1 — start_session
