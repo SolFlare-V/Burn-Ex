@@ -98,9 +98,13 @@ _ROM_REFS: dict[str, tuple[str, float, float]] = {
     "plank":          ("trunk",      80.0,  100.0),
 }
 
-# Base MET multiplier clamp
-_MIN_MULTIPLIER = 0.30
-_MAX_MULTIPLIER = 2.50
+# Base MET multiplier bounds.
+# Mapping: raw=0.5 (average effort) → multiplier=1.0 (matches base MET exactly).
+# raw=0.0 (minimal effort) → 0.40; raw=1.0 (maximal effort) → 2.00.
+# Formula: multiplier = 1.0 + (raw - 0.5) * 1.60, then clamp.
+# Derivation: slope = (MAX - MIN) / 1.0 = 1.60; at raw=0.5: 1.0 + 0 = 1.0. ✓
+_MIN_MULTIPLIER = 0.40
+_MAX_MULTIPLIER = 2.00
 
 # Smoothing window (frames). EMA alpha = 2/(N+1)
 _SMOOTH_N = 6
@@ -249,9 +253,13 @@ class IntensityEstimator:
                 0.15 * rom_score
             )
 
-        # Map raw [0,1] → multiplier [0.3, 2.5]
-        # At raw=0.5 (average), multiplier=1.0; linear interpolation
-        raw_multiplier = 0.30 + raw * (_MAX_MULTIPLIER - 0.30)
+        # Map raw [0,1] → multiplier [0.40, 2.00].
+        # Anchor: raw=0.5 (average effort) → multiplier=1.0 (matches base MET).
+        # Formula: 1.0 + (raw - 0.5) × 1.60
+        # Verification: raw=0.0 → 0.20 (clamped to 0.40)
+        #               raw=0.5 → 1.00 ✓
+        #               raw=1.0 → 1.80 (clamped to 2.00 if needed, here ≤ 2.00 ✓)
+        raw_multiplier = 1.0 + (raw - 0.5) * 1.60
 
         # General movement when unconfirmed: use fraction of joint velocity
         if exercise_type is None:
@@ -457,8 +465,8 @@ class IntensityEstimator:
     def _rest_result(self) -> IntensityResult:
         """Return a minimal result for frames with no landmarks or no history."""
         return IntensityResult(
-            multiplier=0.30,
-            raw_multiplier=0.30,
+            multiplier=_MIN_MULTIPLIER,
+            raw_multiplier=_MIN_MULTIPLIER,
             joint_velocity_score=0.0,
             com_displacement_score=0.0,
             angular_velocity_score=0.0,

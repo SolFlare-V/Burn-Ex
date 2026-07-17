@@ -185,7 +185,8 @@ class CalorieEngine:
         duration_hours = duration_s / 3600.0
 
         met = _load_met_values()[seg.exercise_type]
-        multiplier = max(0.1, float(intensity_multiplier))  # floor at 0.1
+        # Floor matches the minimum from IntensityEstimator (_MIN_MULTIPLIER = 0.40).
+        multiplier = max(0.40, float(intensity_multiplier))
         calories = met * seg.weight_kg * duration_hours * multiplier
 
         seg.end_time = timestamp
@@ -252,7 +253,8 @@ class CalorieEngine:
         elapsed_s = max(0.0, self._last_frame_ts - seg.start_time)
         elapsed_hours = elapsed_s / 3600.0
         met = _load_met_values()[seg.exercise_type]
-        multiplier = max(0.1, float(intensity_multiplier))
+        # Floor matches the minimum from IntensityEstimator (_MIN_MULTIPLIER = 0.40).
+        multiplier = max(0.40, float(intensity_multiplier))
         provisional = met * seg.weight_kg * elapsed_hours * multiplier
 
         return closed_total + provisional
